@@ -65,7 +65,7 @@ GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_TARGET_LUFS = -16.0
-DEFAULT_GATE_THRESHOLD_DB = -45.0
+DEFAULT_GATE_THRESHOLD_DB = -65.0
 PREMIX_LUFS = -20.0   # Per-track target before mixing — equalizes mic vs system levels
 HIGHPASS_HZ = 80.0    # Remove low-frequency rumble from mic
 
