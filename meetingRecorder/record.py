@@ -53,7 +53,7 @@ import noisereduce as nr
 import pyloudnorm as pyln
 import sounddevice as sd
 import soundfile as sf
-from scipy.signal import resample_poly
+from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 
 # --- Constants and config ---------------------------------------------------
@@ -65,6 +65,9 @@ GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_TARGET_LUFS = -16.0
+DEFAULT_GATE_THRESHOLD_DB = -45.0
+PREMIX_LUFS = -20.0   # Per-track target before mixing — equalizes mic vs system levels
+HIGHPASS_HZ = 80.0    # Remove low-frequency rumble from mic
 
 
 # --- Platform detection -----------------------------------------------------
@@ -359,6 +362,70 @@ def mix_tracks(mic: np.ndarray | None, sys_audio: np.ndarray | None) -> np.ndarr
     return np.clip(mic_p + sys_p, -1.0, 1.0).astype(np.float32)
 
 
+def high_pass(audio: np.ndarray, sr: int, cutoff: float = HIGHPASS_HZ) -> np.ndarray:
+    """2nd-order Butterworth high-pass — removes DC offset and low-frequency rumble."""
+    sos = butter(2, cutoff, btype="highpass", fs=sr, output="sos")
+    return sosfilt(sos, audio).astype(np.float32)
+
+
+def noise_gate(
+    audio: np.ndarray,
+    sr: int,
+    threshold_db: float = DEFAULT_GATE_THRESHOLD_DB,
+    hold_ms: float = 100.0,
+    smooth_ms: float = 15.0,
+) -> np.ndarray:
+    """Frame-based noise gate. Cuts audio below threshold with hold + smooth transitions."""
+    if len(audio) < sr // 50:
+        return audio
+
+    threshold = 10.0 ** (threshold_db / 20.0)
+    frame_size = max(1, int(sr * 0.005))   # 5 ms frames
+    n_frames = len(audio) // frame_size
+    if n_frames == 0:
+        return audio.copy()
+
+    # Per-frame RMS → binary gate decision
+    frames = audio[: n_frames * frame_size].reshape(n_frames, frame_size)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    gate_open = (rms > threshold).astype(np.float32)
+
+    # Hold: keep gate open for hold_ms after each above-threshold frame (backward-looking max)
+    hold_frames = max(1, int(hold_ms / 5.0))
+    held = gate_open.copy()
+    for k in range(1, min(hold_frames + 1, n_frames)):
+        shifted = np.concatenate([np.zeros(k, dtype=np.float32), gate_open[:-k]])
+        held = np.maximum(held, shifted)
+
+    # Expand frame-level gain to per-sample, pad tail to match audio length
+    gain = np.repeat(held, frame_size)
+    if len(gain) < len(audio):
+        gain = np.pad(gain, (0, len(audio) - len(gain)), mode="edge")
+
+    # One-pole low-pass on the gain envelope for smooth fades
+    tau = smooth_ms / 1000.0
+    alpha = 1.0 - np.exp(-1.0 / (sr * tau))
+    smoothed = lfilter([alpha], [1.0, alpha - 1.0], gain)
+
+    return (audio * smoothed.astype(np.float32)).astype(np.float32)
+
+
+def normalize_track(audio: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
+    """Normalize a single track to target LUFS (ITU-R BS.1770)."""
+    if len(audio) < int(sr * 0.5):
+        return audio
+    audio64 = audio.astype(np.float64)
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(audio64)
+    if not math.isfinite(loudness):
+        return audio
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
+    return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+
+
 def post_process(
     mic_buf: list,
     sys_buf: list,
@@ -366,6 +433,8 @@ def post_process(
     sys_sr: int,
     out_sr: int,
     denoise: bool,
+    gate: bool,
+    gate_threshold_db: float,
     target_lufs: float,
 ) -> np.ndarray:
     mic_audio: np.ndarray | None = None
@@ -376,14 +445,19 @@ def post_process(
         raw = np.concatenate(mic_buf, axis=0)
         mono = to_mono(raw)
         resampled = resample_audio(mono, mic_sr, out_sr)
+        # High-pass removes HVAC/fan/handling rumble before downstream processing
+        resampled = high_pass(resampled, out_sr)
         if denoise:
             print("Applying noise suppression…", file=sys.stderr)
             resampled = nr.reduce_noise(
                 y=resampled,
                 sr=out_sr,
                 stationary=False,
-                prop_decrease=0.75,
+                prop_decrease=0.9,
             ).astype(np.float32)
+        if gate:
+            print(f"Applying noise gate (threshold {gate_threshold_db:.0f} dB)…", file=sys.stderr)
+            resampled = noise_gate(resampled, out_sr, threshold_db=gate_threshold_db)
         mic_audio = resampled
 
     if sys_buf:
@@ -391,14 +465,24 @@ def post_process(
         raw = np.concatenate(sys_buf, axis=0)
         sys_audio = resample_audio(to_mono(raw), sys_sr, out_sr)
 
+    # Auto-level: when both tracks are present, normalize each to the same pre-mix LUFS
+    # so the mic comes up to match the system audio level before mixing.
+    if mic_audio is not None and sys_audio is not None:
+        print("Matching mic level to system audio…", file=sys.stderr)
+        mic_audio = normalize_track(mic_audio, out_sr, PREMIX_LUFS)
+        sys_audio = normalize_track(sys_audio, out_sr, PREMIX_LUFS)
+
     mixed = mix_tracks(mic_audio, sys_audio)
 
-    print("Normalizing loudness…", file=sys.stderr)
+    print("Normalizing output loudness…", file=sys.stderr)
     audio64 = mixed.astype(np.float64)
     meter = pyln.Meter(out_sr)
     loudness = meter.integrated_loudness(audio64)
     if math.isfinite(loudness):
-        normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
         mixed = np.clip(normalized, -1.0, 1.0).astype(np.float32)
 
     return mixed
@@ -506,6 +590,14 @@ Examples:
     parser.add_argument(
         "--no-denoise", action="store_true",
         help="Skip spectral noise suppression on mic track",
+    )
+    parser.add_argument(
+        "--no-gate", action="store_true",
+        help="Skip noise gate on mic track",
+    )
+    parser.add_argument(
+        "--gate-threshold", type=float, default=DEFAULT_GATE_THRESHOLD_DB,
+        help=f"Noise gate threshold in dB (default: {DEFAULT_GATE_THRESHOLD_DB})",
     )
     parser.add_argument(
         "--target-lufs", type=float, default=DEFAULT_TARGET_LUFS,
@@ -694,6 +786,8 @@ def main() -> None:
         sys_sr=sys_sr,
         out_sr=args.sample_rate,
         denoise=not args.no_denoise and bool(mic_buf),
+        gate=not args.no_gate and bool(mic_buf),
+        gate_threshold_db=args.gate_threshold,
         target_lufs=args.target_lufs,
     )
 
