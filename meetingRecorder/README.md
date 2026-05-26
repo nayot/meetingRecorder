@@ -12,7 +12,7 @@ are declared inline (PEP 723) and resolved on first run.
 
 ```bash
 git clone https://github.com/nayot/meetingRecorder.git
-cd meetingRecorder
+cd meetingRecorder/meetingRecorder
 uv run record.py --list-devices    # first run downloads deps (~1 min)
 ```
 
