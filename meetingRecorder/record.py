@@ -3,7 +3,6 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "sounddevice>=0.5.1",
-#   "soundfile>=0.12",
 #   "numpy>=1.24",
 #   "scipy>=1.11",
 #   "noisereduce>=3.0.3",
@@ -20,7 +19,7 @@ Usage:
     uv run record.py                        # mic + system audio → ~/Documents
     uv run record.py --mic-only             # microphone only
     uv run record.py --system-only          # system audio only
-    uv run record.py -o /tmp/meeting.wav    # custom output path
+    uv run record.py -o /tmp/meeting.m4a    # custom output path
     uv run record.py --upload               # upload to Google Drive after recording
     uv run record.py --list-devices         # show device table and exit
 
@@ -52,7 +51,6 @@ import numpy as np
 import noisereduce as nr
 import pyloudnorm as pyln
 import sounddevice as sd
-import soundfile as sf
 from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 
@@ -488,6 +486,22 @@ def post_process(
     return mixed
 
 
+# --- Output encoding --------------------------------------------------------
+
+def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
+    """Encode float32 mono audio as AAC/M4A via ffmpeg (piped — no temp file)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "f32le", "-ar", str(sample_rate), "-ac", "1",
+        "-i", "pipe:0",
+        "-c:a", "aac", "-b:a", "192k",
+        str(out_path),
+    ]
+    result = subprocess.run(cmd, input=audio.tobytes(), capture_output=True)
+    if result.returncode != 0:
+        sys.exit(f"ffmpeg encoding failed:\n{result.stderr.decode()}")
+
+
 # --- Google Drive -----------------------------------------------------------
 
 def get_gdrive_credentials():
@@ -532,7 +546,7 @@ def upload_to_gdrive(file_path: Path) -> str:
     service = build("drive", "v3", credentials=creds)
 
     print(f"Uploading {file_path.name}…", file=sys.stderr)
-    media = MediaFileUpload(str(file_path), mimetype="audio/wav", resumable=True)
+    media = MediaFileUpload(str(file_path), mimetype="audio/mp4", resumable=True)
     uploaded = (
         service.files()
         .create(
@@ -561,7 +575,7 @@ Examples:
   uv run record.py                          # mic + system, save to ~/Documents
   uv run record.py --mic-only               # microphone only
   uv run record.py --system-only            # system audio only
-  uv run record.py -o /tmp/meeting.wav      # custom output path
+  uv run record.py -o /tmp/meeting.m4a      # custom output path
   uv run record.py --upload                 # record then upload to Google Drive
   uv run record.py --list-devices           # list audio devices and exit
   uv run record.py --mic-device 2           # pick mic by device index
@@ -573,7 +587,7 @@ Examples:
 
     parser.add_argument(
         "-o", "--output", type=Path,
-        help="Output WAV path (default: ~/Documents/meeting_YYYYMMDD_HHMMSS.wav)",
+        help="Output M4A path (default: ~/Documents/meeting_YYYYMMDD_HHMMSS.m4a)",
     )
     parser.add_argument(
         "--mic-device", type=int, default=None,
@@ -622,7 +636,7 @@ def make_output_path(args: argparse.Namespace) -> Path:
     docs = Path("~/Documents").expanduser()
     docs.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return docs / f"meeting_{timestamp}.wav"
+    return docs / f"meeting_{timestamp}.m4a"
 
 
 def format_duration(seconds: float) -> str:
@@ -791,7 +805,7 @@ def main() -> None:
         target_lufs=args.target_lufs,
     )
 
-    sf.write(str(out_path), audio, args.sample_rate, subtype="PCM_16")
+    write_m4a(audio, args.sample_rate, out_path)
     duration = len(audio) / args.sample_rate
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"Saved: {out_path}  ({format_duration(duration)}, {size_mb:.1f} MB)", file=sys.stderr)
