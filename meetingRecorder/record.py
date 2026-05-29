@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from math import gcd
@@ -66,6 +67,22 @@ DEFAULT_TARGET_LUFS = -16.0
 DEFAULT_GATE_THRESHOLD_DB = -65.0
 PREMIX_LUFS = -20.0   # Per-track target before mixing — equalizes mic vs system levels
 HIGHPASS_HZ = 80.0    # Remove low-frequency rumble from mic
+
+# --- Terminal VU display ----------------------------------------------------
+
+_IS_TTY   = sys.stderr.isatty()
+_RED      = "\033[31m" if _IS_TTY else ""
+_RESET    = "\033[0m"  if _IS_TTY else ""
+_EL       = "\033[K"   if _IS_TTY else ""   # Erase to end of line
+_VU_WIDTH = 20
+_VU_DB_MIN = -60.0
+
+
+def render_vu_bar(level_linear: float) -> str:
+    db = 20.0 * math.log10(max(level_linear, 1e-9))
+    ratio = max(0.0, min(1.0, (db - _VU_DB_MIN) / (-_VU_DB_MIN)))
+    filled = int(ratio * _VU_WIDTH)
+    return "█" * filled + "░" * (_VU_WIDTH - filled)
 
 
 # --- Platform detection -----------------------------------------------------
@@ -244,6 +261,7 @@ def recording_thread_sd(
     buffer: list,
     native_sr_out: list,
     is_windows_loopback: bool = False,
+    level_out: list | None = None,
 ) -> None:
     """sounddevice-based recording thread (mic, or system audio on Mac/Windows)."""
     try:
@@ -260,10 +278,12 @@ def recording_thread_sd(
         if is_windows_loopback:
             kwargs["extra_settings"] = sd.WasapiSettings(loopback=True)
 
-        def callback(indata: np.ndarray, frames: int, time, status) -> None:
+        def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             if status:
                 print(f"  [audio] {status}", file=sys.stderr)
             buffer.append(indata.copy())
+            if level_out is not None:
+                level_out[0] = float(np.sqrt(np.mean(indata ** 2)))
 
         with sd.InputStream(callback=callback, **kwargs):
             while not stop_event.is_set():
@@ -729,6 +749,8 @@ def main() -> None:
     sys_buf: list = []
     mic_sr_out: list = []
     sys_sr_out: list = []
+    mic_level: list = [0.0]
+    sys_level: list = [0.0]
     threads: list[threading.Thread] = []
 
     if mic_device_idx is not None:
@@ -736,7 +758,7 @@ def main() -> None:
         mic_channels = min(2, max(1, int(d["max_input_channels"])))
         threads.append(threading.Thread(
             target=recording_thread_sd,
-            args=(mic_device_idx, mic_channels, stop_event, mic_buf, mic_sr_out, False),
+            args=(mic_device_idx, mic_channels, stop_event, mic_buf, mic_sr_out, False, mic_level),
             name="mic-recorder",
             daemon=True,
         ))
@@ -766,6 +788,7 @@ def main() -> None:
                     sys_buf,
                     sys_sr_out,
                     is_win_loopback,
+                    sys_level,
                 ),
                 name="sys-recorder",
                 daemon=True,
@@ -774,11 +797,26 @@ def main() -> None:
     for t in threads:
         t.start()
 
+    start_time = time.time()
     print("Recording… Press Ctrl-C to stop.", file=sys.stderr)
     try:
         while not stop_event.is_set():
-            stop_event.wait(timeout=1.0)
+            if _IS_TTY:
+                elapsed = time.time() - start_time
+                blink = "●" if int(elapsed * 2) % 2 == 0 else "○"
+                parts = [f"\r  {_RED}{blink} REC{_RESET}  {format_duration(elapsed)}"]
+                if mic_device_idx is not None:
+                    parts.append(f"  Mic: {render_vu_bar(mic_level[0])}")
+                if use_system and sys_source is not None:
+                    if sys_source.parec_name:
+                        parts.append("  Sys: ●")
+                    else:
+                        parts.append(f"  Sys: {render_vu_bar(sys_level[0])}")
+                print("".join(parts) + _EL, end="", file=sys.stderr, flush=True)
+            stop_event.wait(timeout=0.1)
     except KeyboardInterrupt:
+        if _IS_TTY:
+            print(f"\r{_EL}", end="", file=sys.stderr)
         print("\nStopping…", file=sys.stderr)
         stop_event.set()
 
