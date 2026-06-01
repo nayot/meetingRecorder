@@ -38,6 +38,7 @@ import math
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from math import gcd
 from pathlib import Path
+
+# Restore SIGINT to default so `kill -INT` works even when launched via
+# `nohup ... &` (which sets SIGINT to SIG_IGN for background processes).
+signal.signal(signal.SIGINT, signal.default_int_handler)
 
 import numpy as np
 import noisereduce as nr
