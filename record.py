@@ -306,6 +306,7 @@ def recording_thread_parec(
     stop_event: threading.Event,
     buffer: list,
     native_sr_out: list,
+    level_out: list | None = None,
 ) -> None:
     """parec-based recording for Linux PipeWire/PulseAudio monitor sources.
 
@@ -332,8 +333,25 @@ def recording_thread_parec(
             stderr=subprocess.PIPE,
         )
 
+        frame_bytes = channels * 4
+        last_size = 0
         while not stop_event.is_set():
-            stop_event.wait(timeout=0.5)
+            if level_out is not None:
+                try:
+                    size = os.path.getsize(tmp_path)
+                    if size > last_size:
+                        read_bytes = min(size - last_size, frame_bytes * 512)
+                        with open(tmp_path, "rb") as f:
+                            f.seek(size - read_bytes)
+                            chunk = f.read(read_bytes)
+                        usable = (len(chunk) // frame_bytes) * frame_bytes
+                        if usable:
+                            arr = np.frombuffer(chunk[:usable], dtype=np.float32)
+                            level_out[0] = float(np.sqrt(np.mean(arr ** 2)))
+                        last_size = size
+                except Exception:
+                    pass
+            stop_event.wait(timeout=0.1)
 
         proc.terminate()
         try:
@@ -779,6 +797,7 @@ def main() -> None:
                     stop_event,
                     sys_buf,
                     sys_sr_out,
+                    sys_level,
                 ),
                 name="sys-recorder",
                 daemon=True,
@@ -813,10 +832,7 @@ def main() -> None:
                 if mic_device_idx is not None:
                     parts.append(f"  Mic: {render_vu_bar(mic_level[0])}")
                 if use_system and sys_source is not None:
-                    if sys_source.parec_name:
-                        parts.append("  Sys: ●")
-                    else:
-                        parts.append(f"  Sys: {render_vu_bar(sys_level[0])}")
+                    parts.append(f"  Sys: {render_vu_bar(sys_level[0])}")
                 print("".join(parts) + _EL, end="", file=sys.stderr, flush=True)
             stop_event.wait(timeout=0.1)
     except KeyboardInterrupt:
