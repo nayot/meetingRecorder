@@ -84,10 +84,30 @@ _VU_DB_MIN = -60.0
 
 
 def render_vu_bar(level_linear: float) -> str:
+    if not math.isfinite(level_linear):
+        level_linear = 0.0
     db = 20.0 * math.log10(max(level_linear, 1e-9))
     ratio = max(0.0, min(1.0, (db - _VU_DB_MIN) / (-_VU_DB_MIN)))
     filled = int(ratio * _VU_WIDTH)
     return "█" * filled + "░" * (_VU_WIDTH - filled)
+
+
+def clean_audio(audio: np.ndarray, label: str | None = None) -> np.ndarray:
+    """Return finite float32 audio; replace NaN/Inf samples with silence."""
+    audio = np.asarray(audio, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        if label:
+            print(f"Warning: non-finite samples in {label}; replacing with silence.", file=sys.stderr)
+        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    return audio.astype(np.float32, copy=False)
+
+
+def rms_level(audio: np.ndarray) -> float:
+    audio = clean_audio(audio)
+    if audio.size == 0:
+        return 0.0
+    level = float(np.sqrt(np.mean(audio ** 2)))
+    return level if math.isfinite(level) else 0.0
 
 
 # --- Platform detection -----------------------------------------------------
@@ -286,9 +306,10 @@ def recording_thread_sd(
         def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             if status:
                 print(f"  [audio] {status}", file=sys.stderr)
-            buffer.append(indata.copy())
+            chunk = clean_audio(indata.copy())
+            buffer.append(chunk)
             if level_out is not None:
-                level_out[0] = float(np.sqrt(np.mean(indata ** 2)))
+                level_out[0] = rms_level(chunk)
 
         with sd.InputStream(callback=callback, **kwargs):
             while not stop_event.is_set():
@@ -347,7 +368,7 @@ def recording_thread_parec(
                         usable = (len(chunk) // frame_bytes) * frame_bytes
                         if usable:
                             arr = np.frombuffer(chunk[:usable], dtype=np.float32)
-                            level_out[0] = float(np.sqrt(np.mean(arr ** 2)))
+                            level_out[0] = rms_level(arr)
                         last_size = size
                 except Exception:
                     pass
@@ -372,41 +393,45 @@ def recording_thread_parec(
             usable = (len(raw) // frame_bytes) * frame_bytes
             if usable:
                 arr = np.frombuffer(raw[:usable], dtype=np.float32).reshape(-1, channels)
-                buffer.append(arr)
+                buffer.append(clean_audio(arr, "parec capture"))
 
 
 # --- Post-processing --------------------------------------------------------
 
 def to_mono(arr: np.ndarray) -> np.ndarray:
+    arr = clean_audio(arr)
     if arr.ndim == 2 and arr.shape[1] > 1:
         return arr.mean(axis=1).astype(np.float32)
     return arr.flatten().astype(np.float32)
 
 
 def resample_audio(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    data = clean_audio(data)
     if src_sr == dst_sr:
         return data
     g = gcd(src_sr, dst_sr)
-    return resample_poly(data, dst_sr // g, src_sr // g).astype(np.float32)
+    return clean_audio(resample_poly(data, dst_sr // g, src_sr // g), "resampled audio")
 
 
 def mix_tracks(mic: np.ndarray | None, sys_audio: np.ndarray | None) -> np.ndarray:
     if mic is None and sys_audio is None:
         sys.exit("No audio was captured.")
     if mic is None:
-        return sys_audio
+        return clean_audio(sys_audio, "system audio")
     if sys_audio is None:
-        return mic
+        return clean_audio(mic, "mic audio")
+    mic = clean_audio(mic, "mic audio")
+    sys_audio = clean_audio(sys_audio, "system audio")
     n = max(len(mic), len(sys_audio))
     mic_p = np.pad(mic, (0, n - len(mic)))
     sys_p = np.pad(sys_audio, (0, n - len(sys_audio)))
-    return np.clip(mic_p + sys_p, -1.0, 1.0).astype(np.float32)
+    return clean_audio(np.clip(mic_p + sys_p, -1.0, 1.0), "mixed audio")
 
 
 def high_pass(audio: np.ndarray, sr: int, cutoff: float = HIGHPASS_HZ) -> np.ndarray:
     """2nd-order Butterworth high-pass — removes DC offset and low-frequency rumble."""
     sos = butter(2, cutoff, btype="highpass", fs=sr, output="sos")
-    return sosfilt(sos, audio).astype(np.float32)
+    return clean_audio(sosfilt(sos, clean_audio(audio)), "high-pass filtered audio")
 
 
 def noise_gate(
@@ -417,6 +442,7 @@ def noise_gate(
     smooth_ms: float = 15.0,
 ) -> np.ndarray:
     """Frame-based noise gate. Cuts audio below threshold with hold + smooth transitions."""
+    audio = clean_audio(audio)
     if len(audio) < sr // 50:
         return audio
 
@@ -453,18 +479,25 @@ def noise_gate(
 
 def normalize_track(audio: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
     """Normalize a single track to target LUFS (ITU-R BS.1770)."""
+    audio = clean_audio(audio)
     if len(audio) < int(sr * 0.5):
         return audio
+    if rms_level(audio) < 1e-8:
+        return np.zeros_like(audio, dtype=np.float32)
     audio64 = audio.astype(np.float64)
     meter = pyln.Meter(sr)
-    loudness = meter.integrated_loudness(audio64)
+    try:
+        loudness = meter.integrated_loudness(audio64)
+    except Exception as e:
+        print(f"Warning: loudness analysis failed ({e}); skipping track normalization.", file=sys.stderr)
+        return audio
     if not math.isfinite(loudness):
         return audio
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-    return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+    return clean_audio(np.clip(normalized, -1.0, 1.0), "normalized track")
 
 
 def post_process(
@@ -490,12 +523,19 @@ def post_process(
         resampled = high_pass(resampled, out_sr)
         if denoise:
             print("Applying noise suppression…", file=sys.stderr)
-            resampled = nr.reduce_noise(
-                y=resampled,
-                sr=out_sr,
-                stationary=False,
-                prop_decrease=0.9,
-            ).astype(np.float32)
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    resampled = nr.reduce_noise(
+                        y=resampled,
+                        sr=out_sr,
+                        stationary=False,
+                        prop_decrease=0.9,
+                    ).astype(np.float32)
+            except Exception as e:
+                print(f"Warning: noise suppression failed ({e}); continuing without it.", file=sys.stderr)
+            resampled = clean_audio(resampled, "noise-suppressed mic")
         if gate:
             print(f"Applying noise gate (threshold {gate_threshold_db:.0f} dB)…", file=sys.stderr)
             resampled = noise_gate(resampled, out_sr, threshold_db=gate_threshold_db)
@@ -516,15 +556,22 @@ def post_process(
     mixed = mix_tracks(mic_audio, sys_audio)
 
     print("Normalizing output loudness…", file=sys.stderr)
+    mixed = clean_audio(mixed, "mixed audio")
+    if rms_level(mixed) < 1e-8:
+        return np.zeros_like(mixed, dtype=np.float32)
     audio64 = mixed.astype(np.float64)
     meter = pyln.Meter(out_sr)
-    loudness = meter.integrated_loudness(audio64)
+    try:
+        loudness = meter.integrated_loudness(audio64)
+    except Exception as e:
+        print(f"Warning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
+        return mixed
     if math.isfinite(loudness):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-        mixed = np.clip(normalized, -1.0, 1.0).astype(np.float32)
+        mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
 
     return mixed
 
@@ -533,6 +580,9 @@ def post_process(
 
 def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
     """Encode float32 mono audio as AAC/M4A via ffmpeg (piped — no temp file)."""
+    audio = clean_audio(audio, "final output")
+    if audio.size == 0:
+        sys.exit("No audio was captured.")
     cmd = [
         "ffmpeg", "-y",
         "-f", "f32le", "-ar", str(sample_rate), "-ac", "1",
@@ -662,7 +712,7 @@ Examples:
     )
     parser.add_argument(
         "--upload", action="store_true",
-        help="Upload output WAV to Google Drive after recording",
+        help="Upload output M4A to Google Drive after recording",
     )
     parser.add_argument(
         "--list-devices", action="store_true",
