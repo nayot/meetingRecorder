@@ -73,6 +73,27 @@ DEFAULT_GATE_THRESHOLD_DB = -65.0
 PREMIX_LUFS = -20.0   # Per-track target before mixing — equalizes mic vs system levels
 HIGHPASS_HZ = 80.0    # Remove low-frequency rumble from mic
 
+
+class ProgressBar:
+    """Step-level progress bar for post-processing; falls back to plain text when not a TTY."""
+
+    def __init__(self, total: int, width: int = 28) -> None:
+        self._total = total
+        self._width = width
+        self._current = 0
+        self._tty = sys.stderr.isatty()
+
+    def step(self, label: str) -> None:
+        self._current += 1
+        if not self._tty:
+            print(f"  {label}", file=sys.stderr)
+            return
+        filled = int(self._width * self._current / self._total)
+        bar = "█" * filled + "░" * (self._width - filled)
+        pct = int(100 * self._current / self._total)
+        end = "\n" if self._current >= self._total else ""
+        print(f"\r  [{bar}] {pct:3d}%  {label:<40}", end=end, file=sys.stderr, flush=True)
+
 # --- Terminal VU display ----------------------------------------------------
 
 _IS_TTY   = sys.stderr.isatty()
@@ -514,15 +535,27 @@ def post_process(
     mic_audio: np.ndarray | None = None
     sys_audio: np.ndarray | None = None
 
+    both = bool(mic_buf) and bool(sys_buf)
+    total_steps = (
+        (1 if mic_buf else 0)
+        + (1 if mic_buf and denoise else 0)
+        + (1 if mic_buf and gate else 0)
+        + (1 if sys_buf else 0)
+        + (1 if both else 0)
+        + 1  # output normalization
+    )
+    print("Post-processing…", file=sys.stderr)
+    pb = ProgressBar(total_steps)
+
     if mic_buf:
-        print("Processing mic track…", file=sys.stderr)
+        pb.step("Mic: resample + high-pass filter")
         raw = np.concatenate(mic_buf, axis=0)
         mono = to_mono(raw)
         resampled = resample_audio(mono, mic_sr, out_sr)
         # High-pass removes HVAC/fan/handling rumble before downstream processing
         resampled = high_pass(resampled, out_sr)
         if denoise:
-            print("Applying noise suppression…", file=sys.stderr)
+            pb.step("Mic: noise suppression")
             try:
                 import warnings
                 with warnings.catch_warnings():
@@ -534,28 +567,28 @@ def post_process(
                         prop_decrease=0.9,
                     ).astype(np.float32)
             except Exception as e:
-                print(f"Warning: noise suppression failed ({e}); continuing without it.", file=sys.stderr)
+                print(f"\nWarning: noise suppression failed ({e}); continuing without it.", file=sys.stderr)
             resampled = clean_audio(resampled, "noise-suppressed mic")
         if gate:
-            print(f"Applying noise gate (threshold {gate_threshold_db:.0f} dB)…", file=sys.stderr)
+            pb.step(f"Mic: noise gate ({gate_threshold_db:.0f} dB threshold)")
             resampled = noise_gate(resampled, out_sr, threshold_db=gate_threshold_db)
         mic_audio = resampled
 
     if sys_buf:
-        print("Processing system audio track…", file=sys.stderr)
+        pb.step("System audio: resample")
         raw = np.concatenate(sys_buf, axis=0)
         sys_audio = resample_audio(to_mono(raw), sys_sr, out_sr)
 
     # Auto-level: when both tracks are present, normalize each to the same pre-mix LUFS
     # so the mic comes up to match the system audio level before mixing.
     if mic_audio is not None and sys_audio is not None:
-        print("Matching mic level to system audio…", file=sys.stderr)
+        pb.step("Level matching (pre-mix LUFS)")
         mic_audio = normalize_track(mic_audio, out_sr, PREMIX_LUFS)
         sys_audio = normalize_track(sys_audio, out_sr, PREMIX_LUFS)
 
     mixed = mix_tracks(mic_audio, sys_audio)
 
-    print("Normalizing output loudness…", file=sys.stderr)
+    pb.step("Output loudness normalization")
     mixed = clean_audio(mixed, "mixed audio")
     if rms_level(mixed) < 1e-8:
         return np.zeros_like(mixed, dtype=np.float32)
@@ -564,7 +597,7 @@ def post_process(
     try:
         loudness = meter.integrated_loudness(audio64)
     except Exception as e:
-        print(f"Warning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
+        print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
         return mixed
     if math.isfinite(loudness):
         import warnings
