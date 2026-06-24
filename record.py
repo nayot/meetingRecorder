@@ -82,17 +82,29 @@ class ProgressBar:
         self._width = width
         self._current = 0
         self._tty = sys.stderr.isatty()
+        self._start = time.monotonic()
+
+    def _render(self, pct: int, label: str, end: str = "") -> None:
+        elapsed = time.monotonic() - self._start
+        if pct > 0:
+            eta = f"{elapsed / pct * (100 - pct):.0f}s"
+        else:
+            eta = "--"
+        filled = int(self._width * pct / 100)
+        bar = "█" * filled + "░" * (self._width - filled)
+        print(f"\r  [{bar}] {pct:3d}%  ETA {eta:<6}  {label:<35}", end=end, file=sys.stderr, flush=True)
 
     def step(self, label: str) -> None:
+        old_pct = int(100 * self._current / self._total)
         self._current += 1
+        new_pct = int(100 * self._current / self._total)
         if not self._tty:
             print(f"  {label}", file=sys.stderr)
             return
-        filled = int(self._width * self._current / self._total)
-        bar = "█" * filled + "░" * (self._width - filled)
-        pct = int(100 * self._current / self._total)
-        end = "\n" if self._current >= self._total else ""
-        print(f"\r  [{bar}] {pct:3d}%  {label:<40}", end=end, file=sys.stderr, flush=True)
+        for pct in range(old_pct + 1, new_pct + 1):
+            self._render(pct, label, "\n" if pct >= 100 else "")
+            if pct < new_pct:
+                time.sleep(0.01)
 
 # --- Terminal VU display ----------------------------------------------------
 
