@@ -34,6 +34,7 @@ Platform notes:
 """
 
 import argparse
+import contextlib
 import math
 import os
 import platform
@@ -75,36 +76,149 @@ HIGHPASS_HZ = 80.0    # Remove low-frequency rumble from mic
 
 
 class ProgressBar:
-    """Step-level progress bar for post-processing; falls back to plain text when not a TTY."""
+    """
+    Weighted progress bar with animated fill and dual ETA (step + overall).
 
-    def __init__(self, total: int, width: int = 28) -> None:
-        self._total = total
+    Steps are assigned weights so expensive operations (noise suppression) own a
+    proportionally larger slice of the bar.  A background thread animates fill
+    within the current step using an asymptotic curve; the step ETA is derived by
+    linear extrapolation from the fill position.  Falls back to plain text when
+    stderr is not a TTY.
+    """
+
+    _BASE_SECS_PER_WEIGHT = 3.0  # initial calibration: seconds per weight unit
+
+    def __init__(self, total_weight: int, width: int = 28) -> None:
+        self._total_weight = total_weight
         self._width = width
-        self._current = 0
         self._tty = sys.stderr.isatty()
-        self._start = time.monotonic()
+        self._overall_start = time.monotonic()
+        self._lock = threading.Lock()
+        self._done_weight = 0
+        self._n_done = 0
+        self._secs_per_weight = self._BASE_SECS_PER_WEIGHT  # EMA-updated
+        # Current step state (written before render thread starts)
+        self._step_start = 0.0
+        self._step_label = ""
+        self._step_old_pct = 0.0
+        self._step_new_pct = 0.0
+        self._step_weight = 1
+        self._stop_render = threading.Event()
 
-    def _render(self, pct: int, label: str, end: str = "") -> None:
-        elapsed = time.monotonic() - self._start
-        if pct > 0:
-            eta = f"{elapsed / pct * (100 - pct):.0f}s"
-        else:
-            eta = "--"
+    def _pct(self, weight: int) -> float:
+        return 100.0 * weight / self._total_weight
+
+    @staticmethod
+    def _fmt_eta(secs: float | None) -> str:
+        if secs is None or not math.isfinite(secs) or secs < 0:
+            return "--"
+        secs = int(secs + 0.5)
+        return f"{secs // 60}m{secs % 60:02d}s" if secs >= 60 else f"{secs}s"
+
+    def _render(self, pct: float, label: str, step_eta: float | None, overall_eta: float | None, end: str = "") -> None:
+        erase = "\033[K" if self._tty else ""
         filled = int(self._width * pct / 100)
         bar = "█" * filled + "░" * (self._width - filled)
-        print(f"\r  [{bar}] {pct:3d}%  ETA {eta:<6}  {label:<35}", end=end, file=sys.stderr, flush=True)
+        o = self._fmt_eta(overall_eta)
+        s = self._fmt_eta(step_eta)
+        print(
+            f"\r  [{bar}] {int(pct):3d}%  ETA {o:<8} step {s:<8} {label}{erase}",
+            end=end, file=sys.stderr, flush=True,
+        )
 
-    def step(self, label: str) -> None:
-        old_pct = int(100 * self._current / self._total)
-        self._current += 1
-        new_pct = int(100 * self._current / self._total)
+    def _render_loop(self) -> None:
+        try:
+            while True:
+                with self._lock:
+                    step_elapsed = time.monotonic() - self._step_start
+                    old = self._step_old_pct
+                    new = self._step_new_pct
+                    weight = self._step_weight
+                    label = self._step_label
+                    spw = self._secs_per_weight
+
+                # tau ensures the fill takes roughly the expected step duration to reach 95%
+                tau = max(spw * weight * 0.6, float(weight) * 2.0)
+                step_range = new - old
+                fill_frac = min(0.95, 1.0 - math.exp(-step_elapsed / tau))
+                current_pct = old + fill_frac * step_range
+
+                # Step ETA: linear extrapolation from fill position toward 95% cap
+                if fill_frac > 0.02:
+                    step_eta: float | None = step_elapsed * (0.95 - fill_frac) / fill_frac
+                    step_eta = max(0.0, step_eta)
+                else:
+                    step_eta = None
+
+                total_elapsed = time.monotonic() - self._overall_start
+                overall_eta: float | None = (
+                    total_elapsed / (current_pct / 100.0) * (1.0 - current_pct / 100.0)
+                    if current_pct > 1.0 else None
+                )
+
+                self._render(current_pct, label, step_eta, overall_eta)
+
+                if self._stop_render.wait(timeout=0.1):
+                    break
+        except Exception:
+            pass
+
+    @contextlib.contextmanager
+    def step(self, label: str, weight: int = 1):
+        """Context manager: animate fill while the body runs, snap to step end on exit."""
+        old_w = self._done_weight
+        old_pct = self._pct(old_w)
+        new_pct = self._pct(old_w + weight)
+
         if not self._tty:
-            print(f"  {label}", file=sys.stderr)
+            print(f"  {label}…", file=sys.stderr)
+            t0 = time.monotonic()
+            try:
+                yield
+            finally:
+                elapsed = time.monotonic() - t0
+                with self._lock:
+                    self._done_weight += weight
+                    self._n_done += 1
+                    rate = elapsed / weight
+                    alpha = 0.3 if self._n_done > 1 else 1.0
+                    self._secs_per_weight = (1 - alpha) * self._secs_per_weight + alpha * rate
             return
-        for pct in range(old_pct + 1, new_pct + 1):
-            self._render(pct, label, "\n" if pct >= 100 else "")
-            if pct < new_pct:
-                time.sleep(0.01)
+
+        with self._lock:
+            self._step_start = time.monotonic()
+            self._step_label = label
+            self._step_old_pct = old_pct
+            self._step_new_pct = new_pct
+            self._step_weight = weight
+        self._stop_render.clear()
+
+        render_thread = threading.Thread(target=self._render_loop, daemon=True, name="pb-render")
+        render_thread.start()
+
+        try:
+            yield
+        finally:
+            elapsed = time.monotonic() - self._step_start
+            self._stop_render.set()
+            render_thread.join(timeout=0.5)
+
+            with self._lock:
+                self._done_weight += weight
+                self._n_done += 1
+                rate = elapsed / weight
+                alpha = 0.3 if self._n_done > 1 else 1.0
+                self._secs_per_weight = (1 - alpha) * self._secs_per_weight + alpha * rate
+
+            if new_pct >= 100.0:
+                self._render(100.0, label, None, None, end="\n")
+            else:
+                total_elapsed = time.monotonic() - self._overall_start
+                overall_eta = (
+                    total_elapsed / (new_pct / 100.0) * (1.0 - new_pct / 100.0)
+                    if new_pct > 1.0 else None
+                )
+                self._render(new_pct, label, 0.0, overall_eta, end="")
 
 # --- Terminal VU display ----------------------------------------------------
 
@@ -548,75 +662,74 @@ def post_process(
     sys_audio: np.ndarray | None = None
 
     both = bool(mic_buf) and bool(sys_buf)
-    total_steps = (
-        (1 if mic_buf else 0)
-        + (1 if mic_buf and denoise else 0)
-        + (1 if mic_buf and gate else 0)
-        + (1 if sys_buf else 0)
-        + (1 if both else 0)
-        + 1  # output normalization
+    # Weights reflect expected relative cost; noise suppression dominates.
+    W_RESAMPLE, W_DENOISE, W_GATE, W_SYS, W_LEVEL, W_NORM = 1, 10, 1, 1, 2, 2
+    total_weight = (
+        (W_RESAMPLE if mic_buf else 0)
+        + (W_DENOISE if mic_buf and denoise else 0)
+        + (W_GATE if mic_buf and gate else 0)
+        + (W_SYS if sys_buf else 0)
+        + (W_LEVEL if both else 0)
+        + W_NORM
     )
     print("Post-processing…", file=sys.stderr)
-    pb = ProgressBar(total_steps)
+    pb = ProgressBar(total_weight)
 
     if mic_buf:
-        pb.step("Mic: resample + high-pass filter")
-        raw = np.concatenate(mic_buf, axis=0)
-        mono = to_mono(raw)
-        resampled = resample_audio(mono, mic_sr, out_sr)
-        # High-pass removes HVAC/fan/handling rumble before downstream processing
-        resampled = high_pass(resampled, out_sr)
+        with pb.step("Mic: resample + high-pass filter", weight=W_RESAMPLE):
+            raw = np.concatenate(mic_buf, axis=0)
+            mono = to_mono(raw)
+            resampled = resample_audio(mono, mic_sr, out_sr)
+            resampled = high_pass(resampled, out_sr)
         if denoise:
-            pb.step("Mic: noise suppression")
-            try:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    resampled = nr.reduce_noise(
-                        y=resampled,
-                        sr=out_sr,
-                        stationary=False,
-                        prop_decrease=0.9,
-                    ).astype(np.float32)
-            except Exception as e:
-                print(f"\nWarning: noise suppression failed ({e}); continuing without it.", file=sys.stderr)
-            resampled = clean_audio(resampled, "noise-suppressed mic")
+            with pb.step("Mic: noise suppression", weight=W_DENOISE):
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        resampled = nr.reduce_noise(
+                            y=resampled,
+                            sr=out_sr,
+                            stationary=False,
+                            prop_decrease=0.9,
+                        ).astype(np.float32)
+                except Exception as e:
+                    print(f"\nWarning: noise suppression failed ({e}); continuing without it.", file=sys.stderr)
+                resampled = clean_audio(resampled, "noise-suppressed mic")
         if gate:
-            pb.step(f"Mic: noise gate ({gate_threshold_db:.0f} dB threshold)")
-            resampled = noise_gate(resampled, out_sr, threshold_db=gate_threshold_db)
+            with pb.step(f"Mic: noise gate ({gate_threshold_db:.0f} dB threshold)", weight=W_GATE):
+                resampled = noise_gate(resampled, out_sr, threshold_db=gate_threshold_db)
         mic_audio = resampled
 
     if sys_buf:
-        pb.step("System audio: resample")
-        raw = np.concatenate(sys_buf, axis=0)
-        sys_audio = resample_audio(to_mono(raw), sys_sr, out_sr)
+        with pb.step("System audio: resample", weight=W_SYS):
+            raw = np.concatenate(sys_buf, axis=0)
+            sys_audio = resample_audio(to_mono(raw), sys_sr, out_sr)
 
-    # Auto-level: when both tracks are present, normalize each to the same pre-mix LUFS
-    # so the mic comes up to match the system audio level before mixing.
     if mic_audio is not None and sys_audio is not None:
-        pb.step("Level matching (pre-mix LUFS)")
-        mic_audio = normalize_track(mic_audio, out_sr, PREMIX_LUFS)
-        sys_audio = normalize_track(sys_audio, out_sr, PREMIX_LUFS)
+        with pb.step("Level matching (pre-mix LUFS)", weight=W_LEVEL):
+            mic_audio = normalize_track(mic_audio, out_sr, PREMIX_LUFS)
+            sys_audio = normalize_track(sys_audio, out_sr, PREMIX_LUFS)
 
     mixed = mix_tracks(mic_audio, sys_audio)
 
-    pb.step("Output loudness normalization")
-    mixed = clean_audio(mixed, "mixed audio")
-    if rms_level(mixed) < 1e-8:
-        return np.zeros_like(mixed, dtype=np.float32)
-    audio64 = mixed.astype(np.float64)
-    meter = pyln.Meter(out_sr)
-    try:
-        loudness = meter.integrated_loudness(audio64)
-    except Exception as e:
-        print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
-        return mixed
-    if math.isfinite(loudness):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-        mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
+    with pb.step("Output loudness normalization", weight=W_NORM):
+        mixed = clean_audio(mixed, "mixed audio")
+        if rms_level(mixed) < 1e-8:
+            return np.zeros_like(mixed, dtype=np.float32)
+        audio64 = mixed.astype(np.float64)
+        meter = pyln.Meter(out_sr)
+        try:
+            loudness = meter.integrated_loudness(audio64)
+        except Exception as e:
+            print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
+            return mixed
+        if math.isfinite(loudness):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
+            mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
 
     return mixed
 
