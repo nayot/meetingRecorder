@@ -657,13 +657,14 @@ def post_process(
     gate: bool,
     gate_threshold_db: float,
     target_lufs: float,
+    out_path: Path,
 ) -> np.ndarray:
     mic_audio: np.ndarray | None = None
     sys_audio: np.ndarray | None = None
 
     both = bool(mic_buf) and bool(sys_buf)
     # Weights reflect expected relative cost; noise suppression dominates.
-    W_RESAMPLE, W_DENOISE, W_GATE, W_SYS, W_LEVEL, W_NORM = 1, 10, 1, 1, 2, 2
+    W_RESAMPLE, W_DENOISE, W_GATE, W_SYS, W_LEVEL, W_NORM, W_ENCODE = 1, 10, 1, 1, 2, 2, 2
     total_weight = (
         (W_RESAMPLE if mic_buf else 0)
         + (W_DENOISE if mic_buf and denoise else 0)
@@ -671,6 +672,7 @@ def post_process(
         + (W_SYS if sys_buf else 0)
         + (W_LEVEL if both else 0)
         + W_NORM
+        + W_ENCODE
     )
     print("Post-processing…", file=sys.stderr)
     pb = ProgressBar(total_weight)
@@ -716,20 +718,24 @@ def post_process(
     with pb.step("Output loudness normalization", weight=W_NORM):
         mixed = clean_audio(mixed, "mixed audio")
         if rms_level(mixed) < 1e-8:
-            return np.zeros_like(mixed, dtype=np.float32)
-        audio64 = mixed.astype(np.float64)
-        meter = pyln.Meter(out_sr)
-        try:
-            loudness = meter.integrated_loudness(audio64)
-        except Exception as e:
-            print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
-            return mixed
-        if math.isfinite(loudness):
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-            mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
+            mixed = np.zeros_like(mixed, dtype=np.float32)
+        else:
+            audio64 = mixed.astype(np.float64)
+            meter = pyln.Meter(out_sr)
+            try:
+                loudness = meter.integrated_loudness(audio64)
+            except Exception as e:
+                print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
+                loudness = float("nan")
+            if math.isfinite(loudness):
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
+                mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
+
+    with pb.step("Encoding to M4A", weight=W_ENCODE):
+        write_m4a(mixed, out_sr, out_path)
 
     return mixed
 
@@ -1070,9 +1076,9 @@ def main() -> None:
         gate=not args.no_gate and bool(mic_buf),
         gate_threshold_db=args.gate_threshold,
         target_lufs=args.target_lufs,
+        out_path=out_path,
     )
 
-    write_m4a(audio, args.sample_rate, out_path)
     duration = len(audio) / args.sample_rate
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"Saved: {out_path}  ({format_duration(duration)}, {size_mb:.1f} MB)", file=sys.stderr)
