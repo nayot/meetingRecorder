@@ -103,6 +103,7 @@ class ProgressBar:
         self._step_old_pct = 0.0
         self._step_new_pct = 0.0
         self._step_weight = 1
+        self._manual_frac: float | None = None
         self._stop_render = threading.Event()
 
     def _pct(self, weight: int) -> float:
@@ -136,16 +137,25 @@ class ProgressBar:
                     weight = self._step_weight
                     label = self._step_label
                     spw = self._secs_per_weight
+                    manual = self._manual_frac
 
-                # tau ensures the fill takes roughly the expected step duration to reach 95%
-                tau = max(spw * weight * 0.6, float(weight) * 2.0)
                 step_range = new - old
-                fill_frac = min(0.95, 1.0 - math.exp(-step_elapsed / tau))
+                # Real progress (e.g. from ffmpeg) takes priority over the timer-based
+                # animation — a fake asymptotic curve can only stall or jump on a step
+                # whose real duration doesn't match the estimate. Cap just under 1.0 so
+                # the step-exit snap still owns the "100% means done" moment.
+                cap = 0.99 if manual is not None else 0.95
+                if manual is not None:
+                    fill_frac = min(cap, manual)
+                else:
+                    # tau ensures the fill takes roughly the expected step duration to reach 95%
+                    tau = max(spw * weight * 0.6, float(weight) * 2.0)
+                    fill_frac = min(cap, 1.0 - math.exp(-step_elapsed / tau))
                 current_pct = old + fill_frac * step_range
 
-                # Step ETA: linear extrapolation from fill position toward 95% cap
+                # Step ETA: linear extrapolation from fill position toward the cap
                 if fill_frac > 0.02:
-                    step_eta: float | None = step_elapsed * (0.95 - fill_frac) / fill_frac
+                    step_eta: float | None = step_elapsed * (cap - fill_frac) / fill_frac
                     step_eta = max(0.0, step_eta)
                 else:
                     step_eta = None
@@ -162,6 +172,11 @@ class ProgressBar:
                     break
         except Exception:
             pass
+
+    def update_progress(self, frac: float) -> None:
+        """External override for the current step's fill fraction (e.g. real ffmpeg progress)."""
+        with self._lock:
+            self._manual_frac = max(0.0, min(1.0, frac))
 
     @contextlib.contextmanager
     def step(self, label: str, weight: int = 1):
@@ -191,6 +206,7 @@ class ProgressBar:
             self._step_old_pct = old_pct
             self._step_new_pct = new_pct
             self._step_weight = weight
+            self._manual_frac = None
         self._stop_render.clear()
 
         render_thread = threading.Thread(target=self._render_loop, daemon=True, name="pb-render")
@@ -735,28 +751,66 @@ def post_process(
                 mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
 
     with pb.step("Encoding to M4A", weight=W_ENCODE):
-        write_m4a(mixed, out_sr, out_path)
+        write_m4a(mixed, out_sr, out_path, progress_cb=pb.update_progress)
 
     return mixed
 
 
 # --- Output encoding --------------------------------------------------------
 
-def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
-    """Encode float32 mono audio as AAC/M4A via ffmpeg (piped — no temp file)."""
+_FFMPEG_OUT_TIME_RE = re.compile(rb"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path, progress_cb=None) -> None:
+    """Encode float32 mono audio as AAC/M4A via ffmpeg (piped — no temp file).
+
+    Reports real encode progress via `progress_cb(fraction)` by parsing ffmpeg's
+    `-progress` stream, rather than a timer-based guess — encode time doesn't scale
+    with the generic step-weight estimate, so a fake animation stalls near the cap
+    while the real encode (which can be slow for long recordings) keeps running.
+    """
     audio = clean_audio(audio, "final output")
     if audio.size == 0:
         sys.exit("No audio was captured.")
+    total_secs = audio.size / sample_rate
     cmd = [
         "ffmpeg", "-y",
         "-f", "f32le", "-ar", str(sample_rate), "-ac", "1",
         "-i", "pipe:0",
         "-c:a", "aac", "-b:a", "192k",
+        "-progress", "pipe:1", "-nostats",
         str(out_path),
     ]
-    result = subprocess.run(cmd, input=audio.tobytes(), capture_output=True)
-    if result.returncode != 0:
-        sys.exit(f"ffmpeg encoding failed:\n{result.stderr.decode()}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def feed_stdin() -> None:
+        try:
+            proc.stdin.write(audio.tobytes())
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
+
+    stderr_chunks: list[bytes] = []
+
+    def drain_stderr() -> None:
+        stderr_chunks.append(proc.stderr.read())
+
+    threading.Thread(target=feed_stdin, daemon=True).start()
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    for raw_line in proc.stdout:
+        m = _FFMPEG_OUT_TIME_RE.match(raw_line.strip())
+        if m and progress_cb and total_secs > 0:
+            h, mnt, s = m.groups()
+            out_secs = int(h) * 3600 + int(mnt) * 60 + float(s)
+            progress_cb(out_secs / total_secs)
+
+    stderr_thread.join()
+    returncode = proc.wait()
+    if returncode != 0:
+        sys.exit(f"ffmpeg encoding failed:\n{b''.join(stderr_chunks).decode()}")
 
 
 # --- Google Drive -----------------------------------------------------------
