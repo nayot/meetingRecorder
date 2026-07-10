@@ -63,6 +63,8 @@ from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 # --- Constants and config ---------------------------------------------------
 
+__version__ = "1.0"
+
 CONFIG_DIR = Path("~/.config/meetingRecorder").expanduser()
 CREDS_PATH = CONFIG_DIR / "credentials.json"
 TOKEN_PATH = CONFIG_DIR / "token.json"
@@ -935,6 +937,9 @@ Examples:
     parser.add_argument(
         "--list-devices", action="store_true",
         help="Print audio device table and exit",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
     )
     return parser
 
