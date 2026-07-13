@@ -64,6 +64,8 @@ from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 # --- Constants and config ---------------------------------------------------
 
+__version__ = "1.0"
+
 CONFIG_DIR = Path("~/.config/meetingRecorder").expanduser()
 CREDS_PATH = CONFIG_DIR / "credentials.json"
 TOKEN_PATH = CONFIG_DIR / "token.json"
@@ -104,6 +106,7 @@ class ProgressBar:
         self._step_old_pct = 0.0
         self._step_new_pct = 0.0
         self._step_weight = 1
+        self._manual_frac: float | None = None
         self._stop_render = threading.Event()
 
     def _pct(self, weight: int) -> float:
@@ -137,16 +140,25 @@ class ProgressBar:
                     weight = self._step_weight
                     label = self._step_label
                     spw = self._secs_per_weight
+                    manual = self._manual_frac
 
-                # tau ensures the fill takes roughly the expected step duration to reach 95%
-                tau = max(spw * weight * 0.6, float(weight) * 2.0)
                 step_range = new - old
-                fill_frac = min(0.95, 1.0 - math.exp(-step_elapsed / tau))
+                # Real progress (e.g. from ffmpeg) takes priority over the timer-based
+                # animation — a fake asymptotic curve can only stall or jump on a step
+                # whose real duration doesn't match the estimate. Cap just under 1.0 so
+                # the step-exit snap still owns the "100% means done" moment.
+                cap = 0.99 if manual is not None else 0.95
+                if manual is not None:
+                    fill_frac = min(cap, manual)
+                else:
+                    # tau ensures the fill takes roughly the expected step duration to reach 95%
+                    tau = max(spw * weight * 0.6, float(weight) * 2.0)
+                    fill_frac = min(cap, 1.0 - math.exp(-step_elapsed / tau))
                 current_pct = old + fill_frac * step_range
 
-                # Step ETA: linear extrapolation from fill position toward 95% cap
+                # Step ETA: linear extrapolation from fill position toward the cap
                 if fill_frac > 0.02:
-                    step_eta: float | None = step_elapsed * (0.95 - fill_frac) / fill_frac
+                    step_eta: float | None = step_elapsed * (cap - fill_frac) / fill_frac
                     step_eta = max(0.0, step_eta)
                 else:
                     step_eta = None
@@ -163,6 +175,11 @@ class ProgressBar:
                     break
         except Exception:
             pass
+
+    def update_progress(self, frac: float) -> None:
+        """External override for the current step's fill fraction (e.g. real ffmpeg progress)."""
+        with self._lock:
+            self._manual_frac = max(0.0, min(1.0, frac))
 
     @contextlib.contextmanager
     def step(self, label: str, weight: int = 1):
@@ -192,6 +209,7 @@ class ProgressBar:
             self._step_old_pct = old_pct
             self._step_new_pct = new_pct
             self._step_weight = weight
+            self._manual_frac = None
         self._stop_render.clear()
 
         render_thread = threading.Thread(target=self._render_loop, daemon=True, name="pb-render")
@@ -658,13 +676,14 @@ def post_process(
     gate: bool,
     gate_threshold_db: float,
     target_lufs: float,
+    out_path: Path,
 ) -> np.ndarray:
     mic_audio: np.ndarray | None = None
     sys_audio: np.ndarray | None = None
 
     both = bool(mic_buf) and bool(sys_buf)
     # Weights reflect expected relative cost; noise suppression dominates.
-    W_RESAMPLE, W_DENOISE, W_GATE, W_SYS, W_LEVEL, W_NORM = 1, 10, 1, 1, 2, 2
+    W_RESAMPLE, W_DENOISE, W_GATE, W_SYS, W_LEVEL, W_NORM, W_ENCODE = 1, 10, 1, 1, 2, 2, 2
     total_weight = (
         (W_RESAMPLE if mic_buf else 0)
         + (W_DENOISE if mic_buf and denoise else 0)
@@ -672,6 +691,7 @@ def post_process(
         + (W_SYS if sys_buf else 0)
         + (W_LEVEL if both else 0)
         + W_NORM
+        + W_ENCODE
     )
     print("Post-processing…", file=sys.stderr)
     pb = ProgressBar(total_weight)
@@ -717,31 +737,45 @@ def post_process(
     with pb.step("Output loudness normalization", weight=W_NORM):
         mixed = clean_audio(mixed, "mixed audio")
         if rms_level(mixed) < 1e-8:
-            return np.zeros_like(mixed, dtype=np.float32)
-        audio64 = mixed.astype(np.float64)
-        meter = pyln.Meter(out_sr)
-        try:
-            loudness = meter.integrated_loudness(audio64)
-        except Exception as e:
-            print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
-            return mixed
-        if math.isfinite(loudness):
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-            mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
+            mixed = np.zeros_like(mixed, dtype=np.float32)
+        else:
+            audio64 = mixed.astype(np.float64)
+            meter = pyln.Meter(out_sr)
+            try:
+                loudness = meter.integrated_loudness(audio64)
+            except Exception as e:
+                print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
+                loudness = float("nan")
+            if math.isfinite(loudness):
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
+                mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
+
+    with pb.step("Encoding to M4A", weight=W_ENCODE):
+        write_m4a(mixed, out_sr, out_path, progress_cb=pb.update_progress)
 
     return mixed
 
 
 # --- Output encoding --------------------------------------------------------
 
-def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
-    """Encode float32 mono audio as AAC/M4A via ffmpeg (piped — no temp file)."""
+_FFMPEG_OUT_TIME_RE = re.compile(rb"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path, progress_cb=None) -> None:
+    """Encode float32 mono audio as AAC/M4A via ffmpeg (piped — no temp file).
+
+    Reports real encode progress via `progress_cb(fraction)` by parsing ffmpeg's
+    `-progress` stream, rather than a timer-based guess — encode time doesn't scale
+    with the generic step-weight estimate, so a fake animation stalls near the cap
+    while the real encode (which can be slow for long recordings) keeps running.
+    """
     audio = clean_audio(audio, "final output")
     if audio.size == 0:
         sys.exit("No audio was captured.")
+    total_secs = audio.size / sample_rate
 
     # Safety net: the fully mixed/processed audio only exists in memory at this
     # point. If the ffmpeg step below fails for any reason, sys.exit would
@@ -755,12 +789,40 @@ def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
         "-f", "f32le", "-ar", str(sample_rate), "-ac", "1",
         "-i", "pipe:0",
         "-c:a", "aac", "-b:a", "192k",
+        "-progress", "pipe:1", "-nostats",
         str(out_path),
     ]
-    result = subprocess.run(cmd, input=audio.tobytes(), capture_output=True)
-    if result.returncode != 0:
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def feed_stdin() -> None:
+        try:
+            proc.stdin.write(audio.tobytes())
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
+
+    stderr_chunks: list[bytes] = []
+
+    def drain_stderr() -> None:
+        stderr_chunks.append(proc.stderr.read())
+
+    threading.Thread(target=feed_stdin, daemon=True).start()
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    for raw_line in proc.stdout:
+        m = _FFMPEG_OUT_TIME_RE.match(raw_line.strip())
+        if m and progress_cb and total_secs > 0:
+            h, mnt, s = m.groups()
+            out_secs = int(h) * 3600 + int(mnt) * 60 + float(s)
+            progress_cb(out_secs / total_secs)
+
+    stderr_thread.join()
+    returncode = proc.wait()
+    if returncode != 0:
         sys.exit(
-            f"ffmpeg encoding failed:\n{result.stderr.decode()}\n\n"
+            f"ffmpeg encoding failed:\n{b''.join(stderr_chunks).decode()}\n\n"
             f"Processed audio was saved to {backup_path} — re-encode it manually, e.g.:\n"
             f"  ffmpeg -i \"{backup_path}\" -c:a aac -b:a 192k \"{out_path}\""
         )
@@ -889,6 +951,9 @@ Examples:
     parser.add_argument(
         "--list-devices", action="store_true",
         help="Print audio device table and exit",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
     )
     return parser
 
@@ -1091,9 +1156,9 @@ def main() -> None:
         gate=not args.no_gate and bool(mic_buf),
         gate_threshold_db=args.gate_threshold,
         target_lufs=args.target_lufs,
+        out_path=out_path,
     )
 
-    write_m4a(audio, args.sample_rate, out_path)
     duration = len(audio) / args.sample_rate
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"Saved: {out_path}  ({format_duration(duration)}, {size_mb:.1f} MB)", file=sys.stderr)
