@@ -58,6 +58,7 @@ import numpy as np
 import noisereduce as nr
 import pyloudnorm as pyln
 import sounddevice as sd
+from scipy.io import wavfile
 from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 
@@ -741,6 +742,14 @@ def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
     audio = clean_audio(audio, "final output")
     if audio.size == 0:
         sys.exit("No audio was captured.")
+
+    # Safety net: the fully mixed/processed audio only exists in memory at this
+    # point. If the ffmpeg step below fails for any reason, sys.exit would
+    # otherwise discard it with no way to recover. Stash it on disk first and
+    # only remove the stash once encoding succeeds.
+    backup_path = out_path.with_name(out_path.name + ".recovery.wav")
+    wavfile.write(backup_path, sample_rate, audio)
+
     cmd = [
         "ffmpeg", "-y",
         "-f", "f32le", "-ar", str(sample_rate), "-ac", "1",
@@ -750,7 +759,12 @@ def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path) -> None:
     ]
     result = subprocess.run(cmd, input=audio.tobytes(), capture_output=True)
     if result.returncode != 0:
-        sys.exit(f"ffmpeg encoding failed:\n{result.stderr.decode()}")
+        sys.exit(
+            f"ffmpeg encoding failed:\n{result.stderr.decode()}\n\n"
+            f"Processed audio was saved to {backup_path} — re-encode it manually, e.g.:\n"
+            f"  ffmpeg -i \"{backup_path}\" -c:a aac -b:a 192k \"{out_path}\""
+        )
+    backup_path.unlink(missing_ok=True)
 
 
 # --- Google Drive -----------------------------------------------------------
@@ -882,6 +896,13 @@ Examples:
 def make_output_path(args: argparse.Namespace) -> Path:
     if args.output:
         p = Path(args.output).expanduser().resolve()
+        if p.suffix.lower() != ".m4a":
+            fixed = p.with_suffix(".m4a") if p.suffix else p.with_name(p.name + ".m4a")
+            print(
+                f"Warning: output is always encoded as AAC/M4A; using {fixed.name} instead of {p.name}",
+                file=sys.stderr,
+            )
+            p = fixed
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
     docs = Path("~/Documents").expanduser()
