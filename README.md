@@ -84,6 +84,34 @@ One-time setup:
 On first `--upload` run, a browser tab opens for consent; the resulting
 token is cached at `~/.config/meetingRecorder/token.json`.
 
+## Renaming & filing recordings (upload.py)
+
+`upload.py` is a companion script for after a recording is done. For each
+`.m4a` file (default: everything in `~/Documents`, or pass paths directly):
+
+1. If the file still has `record.py`'s default name
+   (`meeting_YYYYMMDD_HHMMSS.m4a`), it looks up the Google Calendar event
+   whose time overlaps the recording and renames the file to
+   `"<Meeting Title> - YYYY-MM-DD HHMM.m4a"`. If several events overlap,
+   you're prompted to pick one. Files already given a custom name are left
+   alone.
+2. The (possibly renamed) file is uploaded to a shared Drive folder, then
+   deleted locally — but only after the upload succeeds.
+
+```bash
+uv run upload.py                            # process every *.m4a in ~/Documents
+uv run upload.py meeting_20260721_143000.m4a
+uv run upload.py --dry-run                  # preview only, nothing changes
+uv run upload.py --calendar-id you@example.com
+```
+
+Uses OAuth2 with the `drive` (full) and `calendar.readonly` scopes — wider
+than `record.py`'s `drive.file`, since it needs to read your calendar and
+write into a pre-existing shared folder rather than a file it created
+itself. It reuses `~/.config/meetingRecorder/credentials.json` but caches
+its own token at `~/.config/meetingRecorder/upload_token.json`; first run
+opens a browser tab for the additional consent.
+
 ## Output format
 
 Mono PCM_16 WAV at `--sample-rate` (default 44.1 kHz). This format is
