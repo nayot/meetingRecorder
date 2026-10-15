@@ -21,7 +21,15 @@ Platform extras:
 | OS      | System-audio capture                        | Extra install                                        |
 | ------- | ------------------------------------------- | ---------------------------------------------------- |
 | Linux   | PipeWire/PulseAudio monitor source (parec)  | `pipewire-pulse` or `pulseaudio` (provides `parec`)  |
-| macOS   | Virtual loopback device                     | `brew install blackhole-2ch` + Multi-Output Device   |
+| macOS   | Core Audio process tap (macOS 14.2+)        | Xcode Command Line Tools (`swiftc`); see note below  |
+
+**macOS note:** system audio is captured by `mac_tap.swift`, a small helper that `record.py` compiles into
+`~/.cache/meetingRecorder/` on first run. No BlackHole or Multi-Output Device is needed, and it follows
+whatever output is in use (speakers, headphones, AirPods). On first run macOS asks to let your terminal app
+record system audio; if it was denied, enable the terminal under System Settings → Privacy & Security →
+Screen & System Audio Recording and restart it. On macOS older than 14.2 the script falls back to
+BlackHole (`brew install blackhole-2ch`), which only hears audio routed through a Multi-Output Device.
+If the system track comes out silent, the script prints a warning after recording.
 | Windows | WASAPI loopback on default output           | none                                                 |
 
 ## Usage

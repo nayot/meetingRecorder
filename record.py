@@ -28,13 +28,17 @@ Stop recording with Ctrl-C.
 Platform notes:
   Linux  — system audio via PipeWire/PulseAudio monitor source (parec).
             Requires `pactl` (ships with pipewire-pulse or pulseaudio).
-  Mac    — system audio via BlackHole (brew install blackhole-2ch) or Soundflower.
-            Create a Multi-Output Device in Audio MIDI Setup first.
+  Mac    — system audio via a Core Audio process tap (macOS 14.2+; helper
+            mac_tap.swift is compiled on first run with swiftc). Needs the
+            terminal app allowed under Privacy & Security → Screen & System
+            Audio Recording. Older macOS: BlackHole/Soundflower loopback, with
+            output routed through a Multi-Output Device.
   Windows — system audio via WASAPI loopback on the default output device.
 """
 
 import argparse
 import contextlib
+import hashlib
 import math
 import os
 import platform
@@ -64,7 +68,7 @@ from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 # --- Constants and config ---------------------------------------------------
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 CONFIG_DIR = Path("~/.config/meetingRecorder").expanduser()
 CREDS_PATH = CONFIG_DIR / "credentials.json"
@@ -76,6 +80,10 @@ DEFAULT_TARGET_LUFS = -16.0
 DEFAULT_GATE_THRESHOLD_DB = -65.0
 PREMIX_LUFS = -20.0   # Per-track target before mixing — equalizes mic vs system levels
 HIGHPASS_HZ = 80.0    # Remove low-frequency rumble from mic
+SILENCE_PEAK = 1e-4   # System track peak below this is treated as "captured nothing"
+
+MAC_TAP_SRC = Path(__file__).resolve().parent / "mac_tap.swift"
+CACHE_DIR = Path("~/.cache/meetingRecorder").expanduser()
 
 
 class ProgressBar:
@@ -299,6 +307,41 @@ class SystemSource:
     display_name: str
     native_sr: int
     native_channels: int
+    tap_binary: Path | None = None  # mac_tap helper (macOS Core Audio process tap)
+
+
+def _mac_supports_tap() -> bool:
+    """Core Audio process taps need macOS 14.2+."""
+    try:
+        parts = [int(x) for x in platform.mac_ver()[0].split(".")]
+    except ValueError:
+        return False
+    return tuple((parts + [0, 0])[:2]) >= (14, 2)
+
+
+def _mac_tap_binary() -> Path | None:
+    """Return the compiled mac_tap helper, building it with swiftc if needed."""
+    if not MAC_TAP_SRC.exists():
+        return None
+    digest = hashlib.sha256(MAC_TAP_SRC.read_bytes()).hexdigest()[:12]
+    binary = CACHE_DIR / f"mac_tap-{digest}"
+    if binary.exists():
+        return binary
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    print("Compiling system-audio helper (first run only)…", file=sys.stderr)
+    try:
+        result = subprocess.run(
+            ["swiftc", "-O", str(MAC_TAP_SRC), "-o", str(binary)],
+            capture_output=True, text=True, timeout=300,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"  [warn] Could not build mac_tap ({e}); install Xcode Command Line Tools.",
+              file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(f"  [warn] mac_tap build failed:\n{result.stderr.strip()}", file=sys.stderr)
+        return None
+    return binary
 
 
 def _pactl_find_monitor() -> SystemSource | None:
@@ -361,7 +404,7 @@ def find_system_audio_source() -> SystemSource | None:
     """
     Returns a SystemSource for capturing what the computer is playing, or None.
     Linux: uses pactl to find the default sink's monitor, captured via parec.
-    Mac:   looks for BlackHole/Soundflower in sounddevice device list.
+    Mac:   Core Audio process tap (macOS 14.2+); else BlackHole/Soundflower.
     Windows: uses WASAPI loopback on the default output device.
     """
     plat = get_platform()
@@ -382,6 +425,17 @@ def find_system_audio_source() -> SystemSource | None:
         return _pactl_find_monitor()
 
     elif plat == "mac":
+        if _mac_supports_tap():
+            binary = _mac_tap_binary()
+            if binary:
+                return SystemSource(
+                    device_idx=None,
+                    parec_name=None,
+                    display_name="Core Audio process tap (all system output)",
+                    native_sr=48000,
+                    native_channels=2,
+                    tap_binary=binary,
+                )
         loopback_names = ["blackhole", "soundflower", "loopback"]
         for i, d in enumerate(devices):
             if any(n in d["name"].lower() for n in loopback_names) and d["max_input_channels"] > 0:
@@ -441,6 +495,11 @@ def list_devices() -> None:
         if src:
             print(f"Linux system audio (parec): {src.parec_name}")
             print(f"  {src.native_channels}ch @ {src.native_sr} Hz")
+    elif get_platform() == "mac":
+        if _mac_supports_tap():
+            print("Mac system audio: Core Audio process tap (default; no BlackHole needed)")
+        else:
+            print("Mac system audio: BlackHole/Soundflower (macOS < 14.2, no process tap)")
 
 
 # --- Recording threads ------------------------------------------------------
@@ -560,6 +619,103 @@ def recording_thread_parec(
             if usable:
                 arr = np.frombuffer(raw[:usable], dtype=np.float32).reshape(-1, channels)
                 buffer.append(clean_audio(arr, "parec capture"))
+
+
+def recording_thread_tap(
+    binary: Path,
+    stop_event: threading.Event,
+    buffer: list,
+    native_sr_out: list,
+    level_out: list | None = None,
+) -> None:
+    """macOS system audio via the mac_tap helper (Core Audio process tap).
+
+    Same temp-file pattern as recording_thread_parec: the helper writes
+    interleaved float32 to a file, loaded into buffer after recording stops.
+    The helper prints "FORMAT <rate> <channels>" once capture is set up.
+    """
+    tmp_path = None
+    channels = 2
+    proc = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        proc = subprocess.Popen(
+            [str(binary), tmp_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        line = proc.stdout.readline().split()
+        if len(line) != 3 or line[0] != "FORMAT":
+            err = proc.stderr.read().strip()
+            print(f"  [error] System audio tap failed: {err or 'no output'}", file=sys.stderr)
+            stop_event.set()
+            return
+        native_sr_out.append(int(line[1]))
+        channels = int(line[2])
+
+        frame_bytes = channels * 4
+        last_size = 0
+        while not stop_event.is_set():
+            if proc.poll() is not None:
+                # Exit code 0 = Ctrl-C reached the helper too; not an error.
+                if proc.returncode != 0:
+                    print(f"  [error] System audio tap exited: {proc.stderr.read().strip()}",
+                          file=sys.stderr)
+                break
+            if level_out is not None:
+                try:
+                    size = os.path.getsize(tmp_path)
+                    if size > last_size:
+                        read_bytes = min(size - last_size, frame_bytes * 512)
+                        with open(tmp_path, "rb") as f:
+                            f.seek(size - read_bytes)
+                            chunk = f.read(read_bytes)
+                        usable = (len(chunk) // frame_bytes) * frame_bytes
+                        if usable:
+                            arr = np.frombuffer(chunk[:usable], dtype=np.float32)
+                            level_out[0] = rms_level(arr)
+                        last_size = size
+                except Exception:
+                    pass
+            stop_event.wait(timeout=0.1)
+
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if tmp_path and os.path.exists(tmp_path):
+            frame_bytes = channels * 4
+            raw = open(tmp_path, "rb").read()
+            os.unlink(tmp_path)
+            usable = (len(raw) // frame_bytes) * frame_bytes
+            if usable:
+                arr = np.frombuffer(raw[:usable], dtype=np.float32).reshape(-1, channels)
+                buffer.append(clean_audio(arr, "tap capture"))
+
+
+def warn_if_silent(sys_buf: list, plat: str) -> None:
+    """Warn loudly when the system track is empty or digital silence."""
+    peak = max((float(np.max(np.abs(b))) for b in sys_buf if b.size), default=0.0)
+    if peak >= SILENCE_PEAK:
+        return
+    hint = {
+        "mac": (
+            "Allow your terminal app under System Settings → Privacy & Security →\n"
+            "    Screen & System Audio Recording, then restart the terminal.\n"
+            "    (BlackHole only receives sound if output goes to a Multi-Output Device.)"
+        ),
+        "linux": "Check that the default sink is the one playing (pactl get-default-sink).",
+        "windows": "Check that the default output device is the one playing.",
+    }[plat]
+    print(
+        f"\n{_RED}WARNING: system audio track is silent.{_RESET}\n"
+        f"    Nothing was captured from the computer's output.\n    {hint}\n",
+        file=sys.stderr,
+    )
 
 
 # --- Post-processing --------------------------------------------------------
@@ -1035,9 +1191,11 @@ def main() -> None:
                         )
                     elif plat == "mac":
                         sys.exit(
-                            "No loopback device found. Install BlackHole:\n"
-                            "  brew install blackhole-2ch\n"
-                            "Then create a Multi-Output Device in Audio MIDI Setup."
+                            "No system audio source found. On macOS 14.2+ install the\n"
+                            "Xcode Command Line Tools (xcode-select --install) so the\n"
+                            "process-tap helper can be built. On older macOS install\n"
+                            "BlackHole (brew install blackhole-2ch) and route output\n"
+                            "through a Multi-Output Device in Audio MIDI Setup."
                         )
                     else:
                         sys.exit("Could not find a WASAPI loopback device.")
@@ -1081,7 +1239,14 @@ def main() -> None:
         ))
 
     if use_system and sys_source is not None:
-        if sys_source.parec_name:
+        if sys_source.tap_binary:
+            threads.append(threading.Thread(
+                target=recording_thread_tap,
+                args=(sys_source.tap_binary, stop_event, sys_buf, sys_sr_out, sys_level),
+                name="sys-recorder",
+                daemon=True,
+            ))
+        elif sys_source.parec_name:
             threads.append(threading.Thread(
                 target=recording_thread_parec,
                 args=(
@@ -1137,6 +1302,9 @@ def main() -> None:
 
     for t in threads:
         t.join(timeout=5.0)
+
+    if use_system:
+        warn_if_silent(sys_buf, plat)
 
     if not mic_buf and not sys_buf:
         sys.exit("No audio was captured.")

@@ -14,14 +14,15 @@ uv run record.py --upload         # record then upload to Google Drive
 
 `uv` resolves all Python dependencies declared in the PEP 723 inline script header on first run. `ffmpeg` must also be installed for the M4A encoding step.
 
-There are no tests and no build step — the entire project is `record.py`.
+There are no tests and no build step — the project is `record.py` (plus `mac_tap.swift`, auto-compiled on macOS, and `upload.py`).
 
 ## Architecture
 
 Single-file Python CLI. Two concurrent recording threads feed `list` buffers; post-processing runs after Ctrl-C.
 
 **Recording layer** — platform-specific:
-- **Linux mic / Mac system audio / Windows WASAPI**: `sounddevice.InputStream` callback appends `float32` numpy chunks to a buffer.
+- **Linux mic / Mac mic / Windows WASAPI**: `sounddevice.InputStream` callback appends `float32` numpy chunks to a buffer.
+- **Mac system audio**: `mac_tap.swift` (Core Audio process tap + private aggregate device, macOS 14.2+), compiled by `swiftc` into `~/.cache/meetingRecorder/mac_tap-<hash>` on first run. Same temp-file pattern as `parec`; it prints `FORMAT <rate> <channels>` on stdout before capturing. Falls back to BlackHole/Soundflower via sounddevice on older macOS. BlackHole alone records silence unless output goes through a Multi-Output Device, which is why the tap is the default.
 - **Linux system audio**: `parec` subprocess writing to a **temp file** (not stdout). This is intentional — `parec` buffers differently for pipes vs files; piped capture produces 0 bytes even when audio is playing. After `stop_event` fires, the raw file is read into the buffer and deleted.
 
 **Post-processing chain** (`post_process()`), mic track only:
