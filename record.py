@@ -43,6 +43,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -68,7 +69,7 @@ from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 # --- Constants and config ---------------------------------------------------
 
-__version__ = "1.1"
+__version__ = "1.1.1"
 
 CONFIG_DIR = Path("~/.config/meetingRecorder").expanduser()
 CREDS_PATH = CONFIG_DIR / "credentials.json"
@@ -133,10 +134,10 @@ class ProgressBar:
         bar = "█" * filled + "░" * (self._width - filled)
         o = self._fmt_eta(overall_eta)
         s = self._fmt_eta(step_eta)
-        print(
-            f"\r  [{bar}] {int(pct):3d}%  ETA {o:<8} step {s:<8} {label}{erase}",
-            end=end, file=sys.stderr, flush=True,
-        )
+        line = f"  [{bar}] {int(pct):3d}%  ETA {o:<8} step {s:<8} {label}"
+        if self._tty:
+            line = fit_to_terminal(line)
+        print(f"\r{line}{erase}", end=end, file=sys.stderr, flush=True)
 
     def _render_loop(self) -> None:
         try:
@@ -254,6 +255,26 @@ _RED      = "\033[31m" if _IS_TTY else ""
 _RESET    = "\033[0m"  if _IS_TTY else ""
 _EL       = "\033[K"   if _IS_TTY else ""   # Erase to end of line
 _VU_WIDTH = 20
+_ANSI_RE = re.compile(r"\033\[[0-9;]*[A-Za-z]")
+
+
+def fit_to_terminal(line: str) -> str:
+    """Clip a status line to the terminal width, ignoring ANSI codes.
+
+    A line that wraps breaks the \\r redraw: the cursor returns only to the
+    start of the last wrapped row, so every refresh scrolls the screen.
+    """
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns - 1
+    out, visible, pos = [], 0, 0
+    for m in _ANSI_RE.finditer(line):
+        text = line[pos:m.start()]
+        take = max(0, cols - visible)
+        out.append(text[:take])
+        visible += min(len(text), take)
+        out.append(m.group())
+        pos = m.end()
+    out.append(line[pos:][:max(0, cols - visible)])
+    return "".join(out)
 _VU_DB_MIN = -60.0
 
 
@@ -1287,12 +1308,12 @@ def main() -> None:
             if _IS_TTY:
                 elapsed = time.time() - start_time
                 blink = "●" if int(elapsed * 2) % 2 == 0 else "○"
-                parts = [f"\r  {_RED}{blink} REC{_RESET}  {format_duration(elapsed)}"]
+                parts = [f"  {_RED}{blink} REC{_RESET}  {format_duration(elapsed)}"]
                 if mic_device_idx is not None:
                     parts.append(f"  Mic: {render_vu_bar(mic_level[0])}")
                 if use_system and sys_source is not None:
                     parts.append(f"  Sys: {render_vu_bar(sys_level[0])}")
-                print("".join(parts) + _EL, end="", file=sys.stderr, flush=True)
+                print(f"\r{fit_to_terminal(''.join(parts))}{_EL}", end="", file=sys.stderr, flush=True)
             stop_event.wait(timeout=0.1)
     except KeyboardInterrupt:
         if _IS_TTY:
