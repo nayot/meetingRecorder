@@ -19,7 +19,7 @@ Usage:
     uv run record.py                        # mic + system audio → ~/Documents
     uv run record.py --mic-only             # microphone only
     uv run record.py --system-only          # system audio only
-    uv run record.py -o /tmp/meeting.m4a    # custom output path
+    uv run record.py -o ~/talks/meeting.m4a # custom output path
     uv run record.py --upload               # upload to Google Drive after recording
     uv run record.py --list-devices         # show device table and exit
 
@@ -47,7 +47,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -69,7 +68,7 @@ from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 # --- Constants and config ---------------------------------------------------
 
-__version__ = "1.1.1"
+__version__ = "1.2"
 
 CONFIG_DIR = Path("~/.config/meetingRecorder").expanduser()
 CREDS_PATH = CONFIG_DIR / "credentials.json"
@@ -301,7 +300,11 @@ def rms_level(audio: np.ndarray) -> float:
     audio = clean_audio(audio)
     if audio.size == 0:
         return 0.0
-    level = float(np.sqrt(np.mean(audio ** 2)))
+    flat = audio.reshape(-1)
+    sq = sum(
+        float(np.dot(b, b)) for b in (flat[i : i + (1 << 20)].astype(np.float64) for i in range(0, flat.size, 1 << 20))
+    )
+    level = math.sqrt(sq / audio.size)
     return level if math.isfinite(level) else 0.0
 
 
@@ -523,22 +526,89 @@ def list_devices() -> None:
             print("Mac system audio: BlackHole/Soundflower (macOS < 14.2, no process tap)")
 
 
+# --- Capture files ----------------------------------------------------------
+#
+# Every track is written to a raw float32 file beside the output while recording,
+# and the file is kept until the M4A has been written. Nothing lives only in RAM,
+# so a crash or OOM kill during post-processing loses no audio: rerun with
+# --resume, or encode the raw file by hand with ffmpeg. (Not under /tmp: it is
+# usually a tmpfs, so a "temp file" there is memory too.)
+
+_CAPTURE_RE = re.compile(r"\.(mic|sys)\.(\d+)Hz\.(\d+)ch\.f32le\.raw$")
+
+
+@dataclass
+class Capture:
+    path: Path
+    sample_rate: int
+    channels: int
+
+    def load(self) -> np.ndarray | None:
+        """Memory-map the capture (pages in from disk on demand, not into RSS)."""
+        frame = self.channels * 4
+        n = self.path.stat().st_size // frame if self.path.exists() else 0
+        if n == 0:
+            return None
+        return np.memmap(self.path, dtype=np.float32, mode="r", shape=(n, self.channels))
+
+
+def capture_path(out_path: Path, track: str, sample_rate: int, channels: int) -> Path:
+    return out_path.with_name(f"{out_path.stem}.{track}.{sample_rate}Hz.{channels}ch.f32le.raw")
+
+
+def find_captures(out_path: Path) -> dict[str, Capture]:
+    """Capture files left beside out_path by an earlier run, keyed by track."""
+    found: dict[str, Capture] = {}
+    for p in sorted(out_path.parent.glob(f"{glob_escape(out_path.stem)}.*.raw")):
+        m = _CAPTURE_RE.search(p.name)
+        if m and p.name[: m.start()] == out_path.stem:
+            found[m.group(1)] = Capture(p, int(m.group(2)), int(m.group(3)))
+    return found
+
+
+def glob_escape(name: str) -> str:
+    return re.sub(r"([*?\[])", r"[\1]", name)
+
+
+def print_recovery_help(captures: list[Capture], out_path: Path) -> None:
+    print("\nRaw capture kept on disk:", file=sys.stderr)
+    for c in captures:
+        print(f"  {c.path}", file=sys.stderr)
+    print(
+        f"Finish it with:\n  uv run record.py --resume -o \"{out_path}\"\n"
+        f"or encode a track directly, e.g.:",
+        file=sys.stderr,
+    )
+    c = captures[0]
+    print(
+        f"  ffmpeg -f f32le -ar {c.sample_rate} -ac {c.channels} -i \"{c.path}\" "
+        f"-c:a aac -b:a 192k \"{out_path}\"",
+        file=sys.stderr,
+    )
+
+
 # --- Recording threads ------------------------------------------------------
 
 def recording_thread_sd(
     device_idx: int,
     channels: int,
     stop_event: threading.Event,
-    buffer: list,
-    native_sr_out: list,
+    captures: list,
+    out_path: Path,
+    track: str,
     is_windows_loopback: bool = False,
     level_out: list | None = None,
 ) -> None:
-    """sounddevice-based recording thread (mic, or system audio on Mac/Windows)."""
+    """sounddevice-based recording thread (mic, or system audio on Mac/Windows).
+
+    Each callback's block goes straight to the capture file.
+    """
     try:
         device_info = sd.query_devices(device_idx)
         native_sr = int(device_info["default_samplerate"])
-        native_sr_out.append(native_sr)
+        path = capture_path(out_path, track, native_sr, channels)
+        captures.append(Capture(path, native_sr, channels))
+        f = open(path, "wb")
 
         kwargs: dict = dict(
             device=device_idx,
@@ -552,12 +622,12 @@ def recording_thread_sd(
         def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             if status:
                 print(f"  [audio] {status}", file=sys.stderr)
-            chunk = clean_audio(indata.copy())
-            buffer.append(chunk)
+            chunk = clean_audio(indata)
+            f.write(chunk.tobytes())
             if level_out is not None:
                 level_out[0] = rms_level(chunk)
 
-        with sd.InputStream(callback=callback, **kwargs):
+        with f, sd.InputStream(callback=callback, **kwargs):
             while not stop_event.is_set():
                 stop_event.wait(timeout=0.1)
 
@@ -571,21 +641,19 @@ def recording_thread_parec(
     sample_rate: int,
     channels: int,
     stop_event: threading.Event,
-    buffer: list,
-    native_sr_out: list,
+    captures: list,
+    out_path: Path,
     level_out: list | None = None,
 ) -> None:
     """parec-based recording for Linux PipeWire/PulseAudio monitor sources.
 
-    Writes to a temp file (parec buffers differently on pipes vs files) and
-    loads the data into buffer after recording stops.
+    parec writes straight to the capture file (it buffers differently on pipes
+    vs files).
     """
-    native_sr_out.append(sample_rate)
-    tmp_path = None
+    path = capture_path(out_path, "sys", sample_rate, channels)
+    captures.append(Capture(path, sample_rate, channels))
+    tmp_path = str(path)
     try:
-        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tmp:
-            tmp_path = tmp.name
-
         proc = subprocess.Popen(
             [
                 "parec",
@@ -629,39 +697,24 @@ def recording_thread_parec(
     except FileNotFoundError:
         print("  [error] 'parec' not found — install pipewire-pulse or pulseaudio", file=sys.stderr)
         stop_event.set()
-        return
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            frame_bytes = channels * 4
-            raw = open(tmp_path, "rb").read()
-            os.unlink(tmp_path)
-            usable = (len(raw) // frame_bytes) * frame_bytes
-            if usable:
-                arr = np.frombuffer(raw[:usable], dtype=np.float32).reshape(-1, channels)
-                buffer.append(clean_audio(arr, "parec capture"))
 
 
 def recording_thread_tap(
     binary: Path,
     stop_event: threading.Event,
-    buffer: list,
-    native_sr_out: list,
+    captures: list,
+    out_path: Path,
     level_out: list | None = None,
 ) -> None:
     """macOS system audio via the mac_tap helper (Core Audio process tap).
 
-    Same temp-file pattern as recording_thread_parec: the helper writes
-    interleaved float32 to a file, loaded into buffer after recording stops.
-    The helper prints "FORMAT <rate> <channels>" once capture is set up.
+    Same pattern as recording_thread_parec: the helper writes interleaved
+    float32 to the capture file. It prints "FORMAT <rate> <channels>" once
+    capture is set up; the file is then renamed to carry that format.
     """
-    tmp_path = None
-    channels = 2
+    tmp_path = str(out_path.with_name(f"{out_path.stem}.sys.raw"))
     proc = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tmp:
-            tmp_path = tmp.name
-
         proc = subprocess.Popen(
             [str(binary), tmp_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -670,10 +723,14 @@ def recording_thread_tap(
         if len(line) != 3 or line[0] != "FORMAT":
             err = proc.stderr.read().strip()
             print(f"  [error] System audio tap failed: {err or 'no output'}", file=sys.stderr)
+            Path(tmp_path).unlink(missing_ok=True)
             stop_event.set()
             return
-        native_sr_out.append(int(line[1]))
-        channels = int(line[2])
+        native_sr, channels = int(line[1]), int(line[2])
+        path = capture_path(out_path, "sys", native_sr, channels)
+        os.replace(tmp_path, path)   # the helper keeps writing through its open fd
+        tmp_path = str(path)
+        captures.append(Capture(path, native_sr, channels))
 
         frame_bytes = channels * 4
         last_size = 0
@@ -708,19 +765,23 @@ def recording_thread_tap(
                 proc.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if tmp_path and os.path.exists(tmp_path):
-            frame_bytes = channels * 4
-            raw = open(tmp_path, "rb").read()
-            os.unlink(tmp_path)
-            usable = (len(raw) // frame_bytes) * frame_bytes
-            if usable:
-                arr = np.frombuffer(raw[:usable], dtype=np.float32).reshape(-1, channels)
-                buffer.append(clean_audio(arr, "tap capture"))
 
 
-def warn_if_silent(sys_buf: list, plat: str) -> None:
+def track_peak(audio: np.ndarray | None, block: int = 1 << 20) -> float:
+    """Peak |sample|, a block at a time so a long memmapped track never loads whole."""
+    if audio is None:
+        return 0.0
+    peak = 0.0
+    for i in range(0, len(audio), block):
+        b = np.nan_to_num(np.asarray(audio[i : i + block]))
+        if b.size:
+            peak = max(peak, float(np.max(np.abs(b))))
+    return peak
+
+
+def warn_if_silent(sys_cap: "Capture | None", plat: str) -> None:
     """Warn loudly when the system track is empty or digital silence."""
-    peak = max((float(np.max(np.abs(b))) for b in sys_buf if b.size), default=0.0)
+    peak = track_peak(sys_cap.load() if sys_cap else None)
     if peak >= SILENCE_PEAK:
         return
     hint = {
@@ -740,20 +801,43 @@ def warn_if_silent(sys_buf: list, plat: str) -> None:
 
 
 # --- Post-processing --------------------------------------------------------
+#
+# Whole-track operations would allocate several float64 copies of the track
+# (a 2-hour mono track at 44.1 kHz is 2.5 GB per float64 copy). Filters,
+# resampling and loudness therefore run a block at a time, carrying filter state
+# across blocks, so the results match the whole-track versions while peak memory
+# stays near one float32 copy of each track.
+
+BLOCK = 1 << 20   # samples per processing block (~24 s at 44.1 kHz)
+
 
 def to_mono(arr: np.ndarray) -> np.ndarray:
     arr = clean_audio(arr)
     if arr.ndim == 2 and arr.shape[1] > 1:
-        return arr.mean(axis=1).astype(np.float32)
-    return arr.flatten().astype(np.float32)
+        return arr.mean(axis=1, dtype=np.float32)
+    return np.array(arr.reshape(-1), dtype=np.float32)
 
 
 def resample_audio(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Polyphase resampling in overlapping blocks aligned to the resampling ratio."""
     data = clean_audio(data)
     if src_sr == dst_sr:
         return data
     g = gcd(src_sr, dst_sr)
-    return clean_audio(resample_poly(data, dst_sr // g, src_sr // g), "resampled audio")
+    up, down = dst_sr // g, src_sr // g
+    n = len(data)
+    out_len = -(-n * up // down)
+    out = np.empty(out_len, dtype=np.float32)
+    step = down * max(1, (src_sr * 30) // down)   # ~30 s, a multiple of `down`
+    pad = down * max(1, src_sr // down)           # ~1 s either side absorbs edge effects
+    for i in range(0, n, step):
+        lo, hi = max(0, i - pad), min(n, i + step + pad)
+        y = resample_poly(data[lo:hi], up, down)
+        start = (i - lo) * up // down
+        o = i * up // down
+        cnt = min(step * up // down, out_len - o)
+        out[o : o + cnt] = y[start : start + cnt]
+    return clean_audio(out, "resampled audio")
 
 
 def mix_tracks(mic: np.ndarray | None, sys_audio: np.ndarray | None) -> np.ndarray:
@@ -765,16 +849,26 @@ def mix_tracks(mic: np.ndarray | None, sys_audio: np.ndarray | None) -> np.ndarr
         return clean_audio(mic, "mic audio")
     mic = clean_audio(mic, "mic audio")
     sys_audio = clean_audio(sys_audio, "system audio")
-    n = max(len(mic), len(sys_audio))
-    mic_p = np.pad(mic, (0, n - len(mic)))
-    sys_p = np.pad(sys_audio, (0, n - len(sys_audio)))
-    return clean_audio(np.clip(mic_p + sys_p, -1.0, 1.0), "mixed audio")
+    longer, shorter = (mic, sys_audio) if len(mic) >= len(sys_audio) else (sys_audio, mic)
+    out = writable(longer)
+    out[: len(shorter)] += shorter
+    np.clip(out, -1.0, 1.0, out=out)
+    return clean_audio(out, "mixed audio")
+
+
+def writable(audio: np.ndarray) -> np.ndarray:
+    return audio if audio.flags.writeable else audio.copy()
 
 
 def high_pass(audio: np.ndarray, sr: int, cutoff: float = HIGHPASS_HZ) -> np.ndarray:
     """2nd-order Butterworth high-pass — removes DC offset and low-frequency rumble."""
     sos = butter(2, cutoff, btype="highpass", fs=sr, output="sos")
-    return clean_audio(sosfilt(sos, clean_audio(audio)), "high-pass filtered audio")
+    audio = clean_audio(audio)
+    out = np.empty_like(audio)
+    zi = np.zeros((sos.shape[0], 2))
+    for i in range(0, len(audio), BLOCK):
+        out[i : i + BLOCK], zi = sosfilt(sos, audio[i : i + BLOCK], zi=zi)
+    return clean_audio(out, "high-pass filtered audio")
 
 
 def noise_gate(
@@ -797,7 +891,10 @@ def noise_gate(
 
     # Per-frame RMS → binary gate decision
     frames = audio[: n_frames * frame_size].reshape(n_frames, frame_size)
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    fb = max(1, BLOCK // frame_size)
+    rms = np.concatenate([
+        np.sqrt(np.mean(frames[i : i + fb] ** 2, axis=1) + 1e-12) for i in range(0, n_frames, fb)
+    ])
     gate_open = (rms > threshold).astype(np.float32)
 
     # Hold: keep gate open for hold_ms after each above-threshold frame (backward-looking max)
@@ -807,47 +904,89 @@ def noise_gate(
         shifted = np.concatenate([np.zeros(k, dtype=np.float32), gate_open[:-k]])
         held = np.maximum(held, shifted)
 
-    # Expand frame-level gain to per-sample, pad tail to match audio length
-    gain = np.repeat(held, frame_size)
-    if len(gain) < len(audio):
-        gain = np.pad(gain, (0, len(audio) - len(gain)), mode="edge")
-
-    # One-pole low-pass on the gain envelope for smooth fades
+    # Expand frame-level gain to per-sample (tail padded with the last frame's
+    # gain), then a one-pole low-pass on the envelope for smooth fades — a block
+    # at a time, carrying the filter state across blocks.
     tau = smooth_ms / 1000.0
     alpha = 1.0 - np.exp(-1.0 / (sr * tau))
-    smoothed = lfilter([alpha], [1.0, alpha - 1.0], gain)
+    out = np.empty_like(audio)
+    zi = np.zeros(1)
+    step = fb * frame_size
+    for i in range(0, len(audio), step):
+        n = min(step, len(audio) - i)
+        gain = np.repeat(held[i // frame_size : (i + n) // frame_size], frame_size)
+        if len(gain) < n:
+            gain = np.pad(gain, (0, n - len(gain)), constant_values=held[-1])
+        smoothed, zi = lfilter([alpha], [1.0, alpha - 1.0], gain, zi=zi)
+        out[i : i + n] = audio[i : i + n] * smoothed.astype(np.float32)
+    return out
 
-    return (audio * smoothed.astype(np.float32)).astype(np.float32)
+
+def integrated_loudness(audio: np.ndarray, sr: int) -> float:
+    """Integrated gated loudness (ITU-R BS.1770-4), measured a block at a time.
+
+    Same K-weighting filters and gating as pyloudnorm's Meter.integrated_loudness,
+    which needs several float64 copies of the whole track.
+    """
+    stages = [
+        (f.b, f.a, f.passband_gain, np.zeros(max(len(f.a), len(f.b)) - 1))
+        for f in pyln.Meter(sr)._filters.values()
+    ]
+    hop = int(round(sr * 0.1))    # 400 ms gating blocks with 75 % overlap = 100 ms steps
+    energies: list[np.ndarray] = []
+    carry = np.empty(0)
+    for i in range(0, len(audio), BLOCK):
+        x = np.asarray(audio[i : i + BLOCK], dtype=np.float64)
+        for k, (b, a, g, zi) in enumerate(stages):
+            y, zi = lfilter(b, a, x, zi=zi)
+            stages[k] = (b, a, g, zi)
+            x = g * y
+        x = np.concatenate([carry, x * x])
+        m = len(x) // hop * hop
+        energies.append(x[:m].reshape(-1, hop).sum(axis=1))
+        carry = x[m:]
+    e = np.concatenate(energies) if energies else np.empty(0)
+    if len(e) < 4:
+        return float("nan")
+    z = (e[:-3] + e[1:-2] + e[2:-1] + e[3:]) / (4 * hop)
+    with np.errstate(divide="ignore"):
+        lj = -0.691 + 10.0 * np.log10(z)
+        above_abs = z[lj >= -70.0]
+        if not above_abs.size:
+            return float("-inf")
+        gamma_r = -0.691 + 10.0 * np.log10(above_abs.mean()) - 10.0
+        gated = z[(lj > gamma_r) & (lj > -70.0)]
+        if not gated.size:
+            return float("-inf")
+        return float(-0.691 + 10.0 * np.log10(gated.mean()))
 
 
-def normalize_track(audio: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
-    """Normalize a single track to target LUFS (ITU-R BS.1770)."""
+def normalize_track(audio: np.ndarray, sr: int, target_lufs: float, label: str = "track") -> np.ndarray:
+    """Normalize a single track to target LUFS (ITU-R BS.1770), in place where possible."""
     audio = clean_audio(audio)
     if len(audio) < int(sr * 0.5):
         return audio
     if rms_level(audio) < 1e-8:
         return np.zeros_like(audio, dtype=np.float32)
-    audio64 = audio.astype(np.float64)
-    meter = pyln.Meter(sr)
     try:
-        loudness = meter.integrated_loudness(audio64)
+        loudness = integrated_loudness(audio, sr)
     except Exception as e:
-        print(f"Warning: loudness analysis failed ({e}); skipping track normalization.", file=sys.stderr)
+        print(f"\nWarning: loudness analysis failed ({e}); skipping {label} normalization.", file=sys.stderr)
         return audio
     if not math.isfinite(loudness):
         return audio
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-    return clean_audio(np.clip(normalized, -1.0, 1.0), "normalized track")
+    gain = np.float32(10.0 ** ((target_lufs - loudness) / 20.0))
+    audio = writable(audio)
+    for i in range(0, len(audio), BLOCK):
+        blk = audio[i : i + BLOCK]
+        blk *= gain
+        np.clip(blk, -1.0, 1.0, out=blk)
+    return clean_audio(audio, f"normalized {label}")
 
 
 def post_process(
-    mic_buf: list,
-    sys_buf: list,
-    mic_sr: int,
-    sys_sr: int,
+    mic_cap: Capture | None,
+    sys_cap: Capture | None,
     out_sr: int,
     denoise: bool,
     gate: bool,
@@ -857,15 +996,19 @@ def post_process(
 ) -> np.ndarray:
     mic_audio: np.ndarray | None = None
     sys_audio: np.ndarray | None = None
+    mic_raw = mic_cap.load() if mic_cap else None
+    sys_raw = sys_cap.load() if sys_cap else None
+    has_mic, has_sys = mic_raw is not None, sys_raw is not None
+    denoise, gate = denoise and has_mic, gate and has_mic
 
-    both = bool(mic_buf) and bool(sys_buf)
+    both = has_mic and has_sys
     # Weights reflect expected relative cost; noise suppression dominates.
     W_RESAMPLE, W_DENOISE, W_GATE, W_SYS, W_LEVEL, W_NORM, W_ENCODE = 1, 10, 1, 1, 2, 2, 2
     total_weight = (
-        (W_RESAMPLE if mic_buf else 0)
-        + (W_DENOISE if mic_buf and denoise else 0)
-        + (W_GATE if mic_buf and gate else 0)
-        + (W_SYS if sys_buf else 0)
+        (W_RESAMPLE if has_mic else 0)
+        + (W_DENOISE if has_mic and denoise else 0)
+        + (W_GATE if has_mic and gate else 0)
+        + (W_SYS if has_sys else 0)
         + (W_LEVEL if both else 0)
         + W_NORM
         + W_ENCODE
@@ -873,11 +1016,12 @@ def post_process(
     print("Post-processing…", file=sys.stderr)
     pb = ProgressBar(total_weight)
 
-    if mic_buf:
+    if has_mic:
         with pb.step("Mic: resample + high-pass filter", weight=W_RESAMPLE):
-            raw = np.concatenate(mic_buf, axis=0)
-            mono = to_mono(raw)
-            resampled = resample_audio(mono, mic_sr, out_sr)
+            mono = to_mono(mic_raw)
+            del mic_raw
+            resampled = resample_audio(mono, mic_cap.sample_rate, out_sr)
+            del mono
             resampled = high_pass(resampled, out_sr)
         if denoise:
             with pb.step("Mic: noise suppression", weight=W_DENOISE):
@@ -890,7 +1034,10 @@ def post_process(
                             sr=out_sr,
                             stationary=False,
                             prop_decrease=0.9,
-                        ).astype(np.float32)
+                            n_jobs=1,
+                            # its chunk scratch file goes beside the captures, not /tmp (tmpfs)
+                            tmp_folder=str(out_path.parent),
+                        ).astype(np.float32, copy=False)
                 except Exception as e:
                     print(f"\nWarning: noise suppression failed ({e}); continuing without it.", file=sys.stderr)
                 resampled = clean_audio(resampled, "noise-suppressed mic")
@@ -899,36 +1046,23 @@ def post_process(
                 resampled = noise_gate(resampled, out_sr, threshold_db=gate_threshold_db)
         mic_audio = resampled
 
-    if sys_buf:
+    if has_sys:
         with pb.step("System audio: resample", weight=W_SYS):
-            raw = np.concatenate(sys_buf, axis=0)
-            sys_audio = resample_audio(to_mono(raw), sys_sr, out_sr)
+            mono = to_mono(sys_raw)
+            del sys_raw
+            sys_audio = resample_audio(mono, sys_cap.sample_rate, out_sr)
+            del mono
 
     if mic_audio is not None and sys_audio is not None:
         with pb.step("Level matching (pre-mix LUFS)", weight=W_LEVEL):
-            mic_audio = normalize_track(mic_audio, out_sr, PREMIX_LUFS)
-            sys_audio = normalize_track(sys_audio, out_sr, PREMIX_LUFS)
+            mic_audio = normalize_track(mic_audio, out_sr, PREMIX_LUFS, "mic track")
+            sys_audio = normalize_track(sys_audio, out_sr, PREMIX_LUFS, "system track")
 
     mixed = mix_tracks(mic_audio, sys_audio)
+    del mic_audio, sys_audio
 
     with pb.step("Output loudness normalization", weight=W_NORM):
-        mixed = clean_audio(mixed, "mixed audio")
-        if rms_level(mixed) < 1e-8:
-            mixed = np.zeros_like(mixed, dtype=np.float32)
-        else:
-            audio64 = mixed.astype(np.float64)
-            meter = pyln.Meter(out_sr)
-            try:
-                loudness = meter.integrated_loudness(audio64)
-            except Exception as e:
-                print(f"\nWarning: loudness analysis failed ({e}); skipping output normalization.", file=sys.stderr)
-                loudness = float("nan")
-            if math.isfinite(loudness):
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    normalized = pyln.normalize.loudness(audio64, loudness, target_lufs)
-                mixed = clean_audio(np.clip(normalized, -1.0, 1.0), "normalized output")
+        mixed = normalize_track(mixed, out_sr, target_lufs, "output")
 
     with pb.step("Encoding to M4A", weight=W_ENCODE):
         write_m4a(mixed, out_sr, out_path, progress_cb=pb.update_progress)
@@ -973,7 +1107,8 @@ def write_m4a(audio: np.ndarray, sample_rate: int, out_path: Path, progress_cb=N
 
     def feed_stdin() -> None:
         try:
-            proc.stdin.write(audio.tobytes())
+            for i in range(0, len(audio), BLOCK):
+                proc.stdin.write(memoryview(np.ascontiguousarray(audio[i : i + BLOCK])).cast("B"))
         except BrokenPipeError:
             pass
         finally:
@@ -1079,10 +1214,11 @@ Examples:
   uv run record.py                          # mic + system, save to ~/Documents
   uv run record.py --mic-only               # microphone only
   uv run record.py --system-only            # system audio only
-  uv run record.py -o /tmp/meeting.m4a      # custom output path
+  uv run record.py -o ~/talks/meeting.m4a   # custom output path
   uv run record.py --upload                 # record then upload to Google Drive
   uv run record.py --list-devices           # list audio devices and exit
   uv run record.py --mic-device 2           # pick mic by device index
+  uv run record.py --resume -o talk.m4a     # finish a run that died after recording
 """,
     )
     src = parser.add_mutually_exclusive_group()
@@ -1120,6 +1256,10 @@ Examples:
     parser.add_argument(
         "--target-lufs", type=float, default=DEFAULT_TARGET_LUFS,
         help=f"Target loudness in LUFS (default: {DEFAULT_TARGET_LUFS})",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Don't record: post-process the capture files an earlier run left beside -o",
     )
     parser.add_argument(
         "--upload", action="store_true",
@@ -1172,6 +1312,22 @@ def main() -> None:
 
     out_path = make_output_path(args)
     plat = get_platform()
+
+    leftover = find_captures(out_path)
+    if args.resume:
+        if not args.output:
+            sys.exit("--resume needs -o: the output path the interrupted run was given.")
+        if not leftover:
+            sys.exit(f"No capture files found beside {out_path}.")
+        finish(args, out_path, leftover.get("mic"), leftover.get("sys"))
+        return
+    if leftover:
+        sys.exit(
+            "Capture files from an earlier run are still beside the output:\n"
+            + "".join(f"  {c.path}\n" for c in leftover.values())
+            + f"Finish them with:  uv run record.py --resume -o \"{out_path}\"\n"
+            "or move them away, or choose another output name."
+        )
 
     # Resolve mic device
     mic_device_idx: int | None = None
@@ -1234,6 +1390,7 @@ def main() -> None:
     if use_system and sys_source:
         print(f"  System: {sys_source.display_name}", file=sys.stderr)
     print(f"  Output: {out_path}", file=sys.stderr)
+    print(f"  Raw:    {out_path.with_name(out_path.stem)}.*.raw (kept until the M4A is written)", file=sys.stderr)
     print(file=sys.stderr)
 
     is_win_loopback = (plat == "windows") and use_system and (
@@ -1241,10 +1398,8 @@ def main() -> None:
     )
 
     stop_event = threading.Event()
-    mic_buf: list = []
-    sys_buf: list = []
-    mic_sr_out: list = []
-    sys_sr_out: list = []
+    mic_caps: list[Capture] = []
+    sys_caps: list[Capture] = []
     mic_level: list = [0.0]
     sys_level: list = [0.0]
     threads: list[threading.Thread] = []
@@ -1254,7 +1409,7 @@ def main() -> None:
         mic_channels = min(2, max(1, int(d["max_input_channels"])))
         threads.append(threading.Thread(
             target=recording_thread_sd,
-            args=(mic_device_idx, mic_channels, stop_event, mic_buf, mic_sr_out, False, mic_level),
+            args=(mic_device_idx, mic_channels, stop_event, mic_caps, out_path, "mic", False, mic_level),
             name="mic-recorder",
             daemon=True,
         ))
@@ -1263,7 +1418,7 @@ def main() -> None:
         if sys_source.tap_binary:
             threads.append(threading.Thread(
                 target=recording_thread_tap,
-                args=(sys_source.tap_binary, stop_event, sys_buf, sys_sr_out, sys_level),
+                args=(sys_source.tap_binary, stop_event, sys_caps, out_path, sys_level),
                 name="sys-recorder",
                 daemon=True,
             ))
@@ -1275,8 +1430,8 @@ def main() -> None:
                     sys_source.native_sr,
                     sys_source.native_channels,
                     stop_event,
-                    sys_buf,
-                    sys_sr_out,
+                    sys_caps,
+                    out_path,
                     sys_level,
                 ),
                 name="sys-recorder",
@@ -1289,8 +1444,9 @@ def main() -> None:
                     sys_source.device_idx,
                     sys_source.native_channels,
                     stop_event,
-                    sys_buf,
-                    sys_sr_out,
+                    sys_caps,
+                    out_path,
+                    "sys",
                     is_win_loopback,
                     sys_level,
                 ),
@@ -1324,30 +1480,44 @@ def main() -> None:
     for t in threads:
         t.join(timeout=5.0)
 
+    mic_cap = mic_caps[0] if mic_caps else None
+    sys_cap = sys_caps[0] if sys_caps and use_system else None
     if use_system:
-        warn_if_silent(sys_buf, plat)
+        warn_if_silent(sys_cap, plat)
+    finish(args, out_path, mic_cap, sys_cap)
 
-    if not mic_buf and not sys_buf:
+
+def finish(args: argparse.Namespace, out_path: Path, mic_cap: Capture | None, sys_cap: Capture | None) -> None:
+    """Post-process the capture files into out_path, then delete them.
+
+    On any failure the capture files stay on disk and the recovery commands are
+    printed. (An OOM kill can't print anything, which is why the Raw: line is
+    shown when recording starts.)
+    """
+    caps = [c for c in (mic_cap, sys_cap) if c is not None]
+    empty = [c for c in caps if c.load() is None]
+    if len(empty) == len(caps):
+        for c in caps:
+            c.path.unlink(missing_ok=True)
         sys.exit("No audio was captured.")
 
-    mic_sr = mic_sr_out[0] if mic_sr_out else args.sample_rate
-    sys_sr = sys_sr_out[0] if sys_sr_out else (
-        sys_source.native_sr if sys_source else args.sample_rate
-    )
+    try:
+        audio = post_process(
+            mic_cap=mic_cap,
+            sys_cap=sys_cap,
+            out_sr=args.sample_rate,
+            denoise=not args.no_denoise,
+            gate=not args.no_gate,
+            gate_threshold_db=args.gate_threshold,
+            target_lufs=args.target_lufs,
+            out_path=out_path,
+        )
+    except BaseException:
+        print_recovery_help([c for c in caps if c not in empty], out_path)
+        raise
 
-    audio = post_process(
-        mic_buf=mic_buf,
-        sys_buf=sys_buf if use_system else [],
-        mic_sr=mic_sr,
-        sys_sr=sys_sr,
-        out_sr=args.sample_rate,
-        denoise=not args.no_denoise and bool(mic_buf),
-        gate=not args.no_gate and bool(mic_buf),
-        gate_threshold_db=args.gate_threshold,
-        target_lufs=args.target_lufs,
-        out_path=out_path,
-    )
-
+    for c in caps:
+        c.path.unlink(missing_ok=True)
     duration = len(audio) / args.sample_rate
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"Saved: {out_path}  ({format_duration(duration)}, {size_mb:.1f} MB)", file=sys.stderr)

@@ -38,7 +38,8 @@ If the system track comes out silent, the script prints a warning after recordin
 uv run record.py                            # mic + system → ~/Documents/meeting_YYYYMMDD_HHMMSS.wav
 uv run record.py --mic-only                 # mic only
 uv run record.py --system-only              # system audio only
-uv run record.py -o /tmp/foo.wav            # custom path
+uv run record.py -o ~/talks/foo.m4a         # custom path
+uv run record.py --resume -o ~/talks/foo.m4a  # finish a run that died after recording
 uv run record.py --upload                   # record then upload to Google Drive
 uv run record.py --list-devices             # print device table and exit
 ```
@@ -59,7 +60,29 @@ Stop with **Ctrl-C**.
 | `--no-gate`            | gate on                           | Skip noise gate on mic                         |
 | `--gate-threshold DB`  | `-65`                             | Below this RMS, mic is gated to silence        |
 | `--target-lufs LUFS`   | `-16.0`                           | Final loudness target (podcast standard)       |
+| `--resume`             | —                                 | Post-process leftover raw captures beside `-o` |
 | `--upload`             | —                                 | Upload output to Google Drive                  |
+
+## Raw capture and recovery
+
+While recording, each track is written to a raw file beside the output, e.g.
+`foo.mic.44100Hz.2ch.f32le.raw` and `foo.sys.48000Hz.2ch.f32le.raw`. They are
+deleted only once the M4A has been written. If the run dies during
+post-processing — an error, Ctrl-C, or the kernel's OOM killer, which allows no
+cleanup — the raw files stay, and
+
+```bash
+uv run record.py --resume -o ~/talks/foo.m4a
+```
+
+finishes them. Each raw file can also be encoded on its own:
+`ffmpeg -f f32le -ar 44100 -ac 2 -i foo.mic.44100Hz.2ch.f32le.raw foo.m4a`.
+A new recording refuses to start while raw files for the same output name exist.
+
+Keep the output off `/tmp`: on most Linux systems it is a tmpfs, so files there
+use RAM. Post-processing works a block at a time; a 60-minute mic + system
+recording peaks at about 3 GB (version 1.1.1 needed 11 GB, and was OOM-killed
+after a ~2-hour meeting).
 
 ## Mic processing chain
 
